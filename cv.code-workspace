@@ -1,21 +1,27 @@
 {
 	"folders": [
 		{
+			"name": "cv",
 			"path": "."
 		},
 		{
-			"path": "../../../proj/rs_driver"
-		},
-		{
-			"path": "../../../project/udslib"
-		},
-		{
-			"path": "../../../proj/LidarAssistant"
-		},
-		{
+			"name": "AI-30-Day-Challenge",
 			"path": "../../../proj/AI-30-Day-Challenge"
 		},
 		{
+			"name": "rs_driver",
+			"path": "../../../proj/rs_driver"
+		},
+		{
+			"name": "udslib",
+			"path": "../../../project/udslib"
+		},
+		{
+			"name": "LidarAssistant",
+			"path": "../../../proj/LidarAssistant"
+		},
+		{
+			"name": "safeparamtool",
 			"path": "../../../project/safeparamtool"
 		}
 	],
