@@ -1,0 +1,23 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../../proj/rs_driver"
+		},
+		{
+			"path": "../../../project/udslib"
+		},
+		{
+			"path": "../../../proj/LidarAssistant"
+		},
+		{
+			"path": "../../../proj/AI-30-Day-Challenge"
+		},
+		{
+			"path": "../../../project/safeparamtool"
+		}
+	],
+	"settings": {}
+}
