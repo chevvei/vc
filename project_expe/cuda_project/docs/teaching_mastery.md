@@ -104,6 +104,164 @@ GPU 的 global memory 带宽约 1-2 TB/s（A100 约 2TB/s）。听起来很大�
 
 ---
 
+## 第 0.4 章：片上 vs 片外、SM vs Block、Shared Memory 物理隔离
+
+> **这一章纠正一个最大误区**：很多人把"Block"当成硬件单元，把"片上"理解为整个 GPU。读完本章彻底理顺。
+
+### 0.4.1 "片上"是哪片？
+
+先一句话：**"片上" = GPU 芯片本身那块硅晶片（die）上面**，也就是 GPU 那个大硅裸片，**不是 PCB 电路板，不是显存颗粒**。
+
+#### 📖 硬件事实
+
+GPU 显卡拆开看到两层：
+
+1. **GPU Die（硅晶片/芯片裸片，就是"片"）**：黑色大芯片，光刻出来的硅。
+   - 上面蚀刻出来一堆硬件：84 个 SM、寄存器阵列、L1 缓存、**Shared Memory（SRAM）、L2 Cache**。
+   - → 这些都叫**片上（on-chip）**，就在硅片内部，离 CUDA 核心极近，延迟低。
+2. **GDDR 显存颗粒**：焊在显卡 PCB 电路板上，**不在 GPU 硅片里面** → **片外（off-chip）**，也就是 Global Memory 全局显存。
+
+✅ **Shared Memory 是片上 SRAM**：在 GPU 硅片内部，属于 SM 里面的一块高速内存。
+❌ **Block ≠ 片上！**：Block 是软件逻辑概念，不是硬件。
+
+### 0.4.2 Block（线程块）：软件概念，不是硬件！
+
+CUDA 里：
+
+- **Block（线程块）**：写代码时定义的逻辑分组，多个线程组成一个 block。
+- **SM（流多处理器）**：**硬件单元**，硅片上真实存在的硬件。
+
+#### 🔧 硬件调度规则
+
+> - 一个**完整 Block 只能部署在同一个 SM 上**；**Block 不能跨 SM 拆分**。
+> - 一个 SM 同一时刻可以承载若干个 block（资源够就放多个）。
+> - ✅ 同一个 block 内所有线程 → 能访问这块 SM 上**同一份 shared memory**。
+> - ❌ **A block 不能访问 B block 的 shared memory**，哪怕 A 和 B 同驻一个 SM。
+
+#### ⚠️ 重点纠正
+
+- Shared memory **隶属于 SM 硬件**，不是隶属于 block。
+- 当 block 执行结束，这块 shared 内存就**释放回收**，给下一个 block 复用。
+- Block 只是软件线程分组，不是硬件，**block 不是片上**。
+- "不同 block 无法调度" → ❌ 表述不对。✅ 修正：**多个 block 可以被硬件调度到不同 SM 上并行跑**；但是 **A block 不能访问 B block 的 shared memory**。
+
+### 0.4.3 Global Memory 是什么？
+
+**Global Memory = 焊在显卡电路板上的 GDDR 显存颗粒（片外，不在 GPU 硅 die 里面）**。
+
+- **所有 SM（所有处理器）全都可以访问全局显存**。
+- 所有 block，不管跑在哪个 SM，读写的是**同一块全局内存空间**。
+- 不是"多个处理器之间的内存"，是**整个 GPU 所有 SM 共享的大容量片外内存**。
+
+### 0.4.4 极简关系汇总
+
+| 概念 | 位置 | 属性 | 速度 | 容量 |
+|------|------|------|------|------|
+| **片上 on-chip** | GPU 硅晶片 die 内部 | Register / Shared Memory / L1 / L2 | 快 | 小 |
+| **片外 off-chip** | PCB 板上 GDDR 显存 | Global Memory | 慢 | 大 |
+| **SM** | 片上真实硬件 | 硅片上蚀刻的处理器单元 | — | — |
+| **Block** | 软件逻辑分组 | 代码里定义的线程组，不是硬件 | — | — |
+
+调度规则：
+1. 一个 Block **整体分配到某一个 SM 上运行**；Block 不能跨 SM 拆分。
+2. Shared Memory 属于 SM 硬件资源；同一 block 内线程共享这块 SM 上的 shared memory。
+3. 不同 block 之间**无法互相访问 shared memory**（即使同驻一个 SM）。
+4. Global Memory（GDDR）是片外，**GPU 全部 SM 都能读写**，容量大、访问延迟几百 cycle。
+
+### 0.4.5 🏠 比喻（好记）
+
+**GPU 硅片（片）= 一栋大楼**，大楼里面有 84 个独立房间，每个房间就是一个 SM。
+
+- **Shared Memory**：**房间里面自带的储物柜（片上 SRAM）**。
+- **Block**：**一批工人（线程）**，整组工人全部安排在**同一个房间（SM）**干活。
+  - 同一组工人（block）可以共用这个房间储物柜（shared）。
+  - 另外一组工人放到另一个房间，**不能跑到别的房间拿储物柜东西**。
+- **Global 显存**：**大楼外面很远的公共大仓库（片外 GDDR）**，大楼里所有房间（所有 SM）都可以去这个大仓库取货，但是跑过去取货很慢（几百 cycle 延迟）。
+
+---
+
+### 0.4.6 Shared Memory 的物理划分与隔离（深度理解）
+
+> 继续储物柜比喻：SM = 一间房间，Shared Memory = **这个房间里固定大小的储物柜（整块物理 SRAM，片上硬件）**，Block = 一组工人。
+
+#### 🎯 核心一句话
+
+**SM 的 shared memory 是一整块物理 SRAM。当你把多个 block 放到同一个 SM 上，硬件会把这块物理 SRAM 进行静态划分：给每个 block 分配独立的一块区域，互相隔离，互不干扰。**
+
+- ✅ 每个 block **拥有属于自己的那一份 shared 内存**。
+- ✅ Block A 看不到、不能读写 block B 在同一个 SM 里的 shared memory。
+- ✅ 当 block 执行结束退出，它占用的这块 shared 内存空间**回收**，可以分配给后续调度进来的新 block。
+
+#### 💡 举例（Ampere SM：shared 总大小最多 164KB）
+
+假设 kernel 里每个 block 声明要用 **32KB shared memory**：
+
+```
+单个 SM 总共有 164KB 储物柜
+164 / 32 ≈ 5   →  这个 SM 最多可以同时驻留 5 个 block
+
+硬件自动把 164KB 切成 5 份，每份 32KB：
+┌─────────┬─────────┬─────────┬─────────┬─────────┬─────┐
+│ Block0  │ Block1  │ Block2  │ Block3  │ Block4  │空闲 │
+│ 0-32KB  │32-64KB  │64-96KB  │96-128KB │128-160KB│4KB  │
+└─────────┴─────────┴─────────┴─────────┴─────────┴─────┘
+
+每个 block 的线程只能访问分配给自己的那一段
+硬件做内存保护，不能越界读写别的 block 的 shared
+```
+
+#### ⚠️ 关键规则
+
+1. **分配粒度是 kernel 编译时确定**：代码里 `__shared__ float s_data[XXX]`，编译阶段就算出**单个 block 需要多少 shared**。
+2. 硬件在往 SM 加载 block 之前，先检查：剩余 shared 内存够不够放下这个 block 需要的 shared。不够，就不会把这个 block 调度到这个 SM。
+
+> 👉 **这就是为什么：单个 block 申请的 shared 越大，同一个 SM 能同时放的 block 数量越少 → achieved occupancy 下降**（和 ncu 指标串上了！）
+
+#### 🔄 生命周期
+
+1. Block 被调度进入 SM → 硬件从 SM 整块 shared 内存里划出一块专属区域给这个 block。
+2. Block 内部线程读写属于自己这块 shared，和同 SM 上其他 block **完全隔离，互不干扰**。
+3. Block 所有线程全部执行完成，block 退出 → 这块 shared 内存**释放，回收**，可以分配给新来的 block。
+
+#### 🚫 容易踩坑的误区
+
+| 误区 | 正解 |
+|------|------|
+| ❌ 每个 block 自带一块独立物理 SRAM | ✅ 物理硬件只有**一整块 SRAM 在 SM 里**，是划分空间，逻辑隔离 |
+| ❌ 同一个 SM 上多个 block 可以互相读写对方 shared | ✅ 不行！硬件隔离，互相不可见。shared 内存**作用域只在本 block** |
+| ❌ shared 是动态 malloc，运行时随便申请大小 | ✅ 不是。`__shared__` 大小编译期固定，硬件提前算好一个 block 占多少 shared |
+
+---
+
+### 0.4.7 🗣️ 面试口述精简版
+
+> "片上"指 GPU 的硅芯片 die 内部。Shared Memory 是片上 SRAM，集成在 SM 硬件里面。
+>
+> Block 是软件上的线程分组，**不是硬件**；一个 block 必须全部跑在同一个 SM 上，所以同一个 block 内线程共享这个 SM 的 shared memory。不同 block 可以调度到不同 SM 并行执行，但**无法互相访问对方的 shared memory**——哪怕同驻一个 SM，硬件也会把 SM 的整块 SRAM 静态划分给各个 block，互相隔离。
+>
+> 单个 block 申请的 shared 越大，同一个 SM 能同时容纳的 block 越少，会拉低 occupancy。block 执行完毕，它占的 shared 空间回收，给后续 block 复用。
+>
+> 全局内存 Global Memory 是片外的 GDDR 显存，不在硅片内部，GPU 所有 SM 都能访问它，容量大但访问延迟很高。
+
+### 0.4.8 ❓ 自测
+
+**Q1**：多个 block 能不能放到同一个 SM 上？
+> 可以，SM 资源够的话，可以加载多个 block，分时调度 warps。但是这些 block 各自独立，不能互访 shared memory。
+
+**Q2**：shared memory 是每个 block 单独分配一块物理 SRAM 吗？
+> 不是。SM 有一块物理 shared SRAM。block 占用一部分，block 执行完就释放，供下一个 block 复用。
+
+**Q3**：同一个 SM 上两个 block，能通过 shared memory 互相传数据吗？
+> 不能。shared 的作用域仅限 block 内部。block 之间通信只能走全局显存 Global Memory。
+
+**Q4**：为什么 block 声明的 shared 越大，occupancy 越低？
+> SM 的 shared SRAM 总量固定（如 Ampere 164KB）。一个 block 要 32KB → 同 SM 最多 5 个 block；要 80KB → 最多 2 个。block 数量少 = 同时驻留的 warp 少 = occupancy 低。
+
+**Q5**：Block 能不能跨 SM 拆分？
+> 不能。一个完整 block 必须全部跑在同一个 SM 上，这是硬件规则。
+
+---
+
 ## 第 1 章：数据搬运优化
 
 ### 1.1 Pinned Memory（锁页内存）
