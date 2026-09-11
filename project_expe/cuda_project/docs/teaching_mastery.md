@@ -507,6 +507,257 @@ __shared__ float buf[1024 + 1];  // padding 1 个元素
 
 ## 第 3 章：并行调度优化
 
+> ⚠️ **本章导读**：阶段 5 是整个项目的性能高潮（59ms → 4.72ms）。三个技术——smem tiling、bank conflict 规避、warp shuffle——表面是三个故事，但内部都对应**硬件事实 + 代码映射 + 工程取舍**。下面先把三个故事"切片深挖"到代码层和工程层，再展开每个技术。
+
+### 3.0 三故事深挖：从故事 → 硬件 → 代码 → 工程
+
+#### 📕 故事 1 深挖：Shared Memory Tiling —— 工地协作
+
+**故事回顾**：1000 工人查 10000 块砖哪个离自己最近。不分组 = 1000×10000 = 1000 万次仓库访问；分 256 人一组协作搬 1024 块到工位共享 → 每块搬 1 次被 4 人查，仓库访问降到 250 万次。
+
+**❓ tiling 是不是"分块"？**
+✅ **是。但比普通的"分块"更精确**：
+- "分块"是结果——把 10000 个点切成 10 个 1024 大小的 tile
+- "tiling"是机制——**block 内 256 线程协作把一个 tile 从 global 搬到 smem，让 256 个线程共享这 1024 个点**
+- 关键不在"切"，而在"**协作搬运 + 块内复用**"——这才是 tiling 的工程本质
+
+**🔧 硬件事实（为什么能省 4 倍）**：
+1. global → smem 一次搬 1024 个点 = 256 线程 × 每线程搬 1 个 = 256 次合并访存（1 个 cache line 搬 32 个 float，刚好 8 个事务）
+2. 搬到 smem 后，**256 个线程都从 smem 读这 1024 个点**——读 smem 不走 global，免费
+3. 复用率 = tile_size / block_size = 1024 / 256 = **4 倍**：每点从 global 搬 1 次，被 4 个线程从 smem 读 4 次
+
+**📍 代码映射**（[knn_search_kernel.cu:55-76](file:///home/sti/Documents/trae_projects/cv/project_expe/cuda_project/src/knn_search_kernel.cu)）：
+
+```cpp
+// 外层循环：遍历所有 tile
+for (size_t tileStart = 0; tileStart < cloudN; tileStart += blockDim.x) {
+    // ① 协作拷贝：thread t 搬 tile 中第 t 个点（一人搬一块砖）
+    size_t gi = tileStart + tid;
+    if (gi < cloudN) {
+        tileX[tid] = cxs[gi];   // ← 这里是 global→smem 的搬运
+        tileY[tid] = cys[gi];
+        tileZ[tid] = czs[gi];
+    }
+    __syncthreads();   // ② 等 256 人都搬完，smem 数据就绪
+    // ③ 全 block 从 smem 读，每个线程算自己的最近候选
+    if (gi < cloudN) {
+        float dx = tileX[tid] - qx;   // ← 从 smem 读，不是 global
+        ...
+    }
+    __syncthreads();   // ④ 等全 block 用完，再搬下一 tile
+}
+```
+
+**🎯 工程取舍**（tile 大小怎么选）：
+- tile 太小（如 32）：复用率 32/256<1，没省到，还多了 syncthreads 开销 → 慢
+- tile 太大（如 16384）：一个 block 的 smem 占用 = 16384×3×4B = 192KB，超出 SM 的 164KB 上限 → 跑不起来；即使跑起来，一个 SM 只能放 1 个 block → occupancy 暴跌
+- 我们选 256：tile = blockDim，一人搬一个，零冗余搬运；smem 占用 3KB，一个 SM 还能放 5+ 个 block，occupancy 健康
+
+**⚠️ 代码里的"反直觉"细节**：很多人写 tiling 是"全 block 每个线程扫整个 tile"——我们**不是**这么写的。看代码第 70 行：`if (gi < cloudN) { float dx = tileX[tid] - qx; }`——**每个线程只算 tile 中第 tid 个位置**，不扫整个 tile。这样 256 线程并行处理 256 个点，零重复工作。扫整个 tile 是旧版 bug，180ms 比 SoA baseline 还慢，已修复。
+
+---
+
+#### 📕 故事 2 深挖：Bank Conflict —— 超市 32 收银台
+
+**故事回顾**：smem 内部分 32 个收银台（bank），warp 32 线程每人去一个收银台。无冲突 = 32 路并行；撞同一个收银台 = 串行排队。
+
+**❓ "多人撞同一收银台"在什么情况发生？**
+
+核心是**地址映射规则**：`bank_id = (byte_address / 4) % 32`。每 4 字节一个 bank，32 个 bank 一组循环。
+
+**3 种典型撞 bank 场景**：
+
+**场景 A：stride 访问（最经典坑）**
+```cpp
+__shared__ float buf[1024];
+// 线程 i 访问 buf[i * 32]
+float v = buf[threadIdx.x * 32];
+// 线程0: addr=0,    bank=(0/4)%32=0
+// 线程1: addr=128,  bank=(128/4)%32=0   ← 撞 bank 0！
+// 线程2: addr=256,  bank=(256/4)%32=0   ← 撞 bank 0！
+// ... 32 线程全撞 bank 0 → 32 路串行
+```
+
+**场景 B：矩阵转置按列读**
+```cpp
+__shared__ float mat[32][32];
+// 线程 i 读 mat[i][0] 的列
+float v = mat[threadIdx.x][0];
+// 线程0: addr=0,    bank=0
+// 线程1: addr=128,  bank=0   ← 列方向每行跨 32 个 float=128B，全映射到 bank 0
+```
+
+**场景 C：结构体数组放 smem**
+```cpp
+struct Point { float x, y, z; };
+__shared__ Point pts[32];
+// 线程 i 读 pts[i].x
+float v = pts[threadIdx.x].x;
+// 线程0: addr=0,    bank=0
+// 线程1: addr=12,   bank=(12/4)%32=3   ← 没撞！
+// 线程2: addr=24,   bank=6
+// 这里恰好分散开了，但 pts[i].y 又是另一组 bank
+```
+
+**❓ Padding 为什么有用？——打断"周期对齐"**
+
+```cpp
+// 有冲突：1024 是 32 的整数倍
+__shared__ float buf[1024];
+// 线程 i 访问 buf[i * 32]
+// bank = (i*32*4 / 4) % 32 = (i*32) % 32 = 0  ← 永远是 0！
+
+// Padding：数组改 1025
+__shared__ float buf[1025];
+// 还是要错开访问模式，配合 padding
+// 线程 i 访问 buf[i * 33]  ← stride 改成 33 不是 32
+// bank = (i*33*4 / 4) % 32 = (i*33) % 32
+// i=0: 0, i=1: 1, i=2: 2, ... 全部不同 bank！
+```
+
+**🔑 本质**：padding 不是"加一个元素就完了"，而是**让 stride 不再是 32 的整数倍**。bank 映射是 mod 32，只要 stride 和 32 互质（如 33），就保证 32 线程访问 32 个不同 bank。
+
+**📍 我们项目里有 bank conflict 吗？**
+
+看 [knn_search_kernel.cu:35-37](file:///home/sti/Documents/trae_projects/cv/project_expe/cuda_project/src/knn_search_kernel.cu)：
+```cpp
+float* tileX = smem;              // tileX[0..255]
+float* tileY = smem + blockDim.x; // tileY[0..255]
+float* tileZ = smem + 2*blockDim.x;
+```
+访问模式：线程 tid 读 `tileX[tid], tileY[tid], tileZ[tid]`。
+- tid=0: tileX[0] @ bank 0, tileY[0] @ bank 0 (smem+256, 256*4=1024B, bank=(1024/4)%32=0)
+- tid=1: tileX[1] @ bank 1, tileY[1] @ bank 1
+
+**看起来 X/Y/Z 的 tid 都映射到同一 bank？** 实际不会冲突，因为**访问是分时的**——dx/dy/dz 是三条独立 load 指令，每条指令下 32 线程读 tileX[0..31] 是连续 32 个 bank → 无冲突。三条指令顺序执行，互不干扰。
+
+**⚠️ 但归约阶段有潜在 conflict**：
+```cpp
+float* warpBestDist = smem + 3 * blockDim.x;  // warpBestDist[8]
+int* warpBestIdx = (int*)(smem + 3*blockDim.x + blockDim.x/32);
+```
+warp 0 的 32 线程读 `warpBestDist[lane]`（lane<8 才有数据，其余读 1e30f）。lane 0..7 各读不同 bank，lane 8..31 都读同一个 padding 值 1e30f——**这是广播，不算 conflict**（硬件优化了广播）。
+
+**🛠️ 怎么定位**：
+```bash
+ncu --metrics shared_mem_utilization,l1_shared_memory_bank_conflicts ./cuda_spatial_accel
+# Nsight Compute Source 页面会标红冲突行
+```
+
+---
+
+#### 📕 故事 3 深挖：Warp Shuffle —— 32 人传话游戏
+
+**故事回顾**：32 人站成一圈找最小值。朴素 = 写白板+串行比较 32 次；shuffle = 5 轮传话，每轮看对面的人取小，log2(32)=5 步全找到。
+
+**❓ 为什么是 5 步？**
+
+32 = 2^5，**树形归约**：每轮人数减半。
+
+```
+轮次  offset  配对方式       剩余候选
+─────────────────────────────────────
+ 1     16     0↔16, 1↔17...    32→16
+ 2     8      0↔8,  1↔9...     16→8
+ 3     4      0↔4,  1↔5...     8→4
+ 4     2      0↔2,  1↔3...     4→2
+ 5     1      0↔1,  2↔3...     2→1  ← 全员一致
+```
+
+**🔧 硬件本质（为什么不走 smem）**：
+
+`__shfl_xor_sync` 是一条**硬件指令**，让 warp 内线程直接读对方**寄存器**的值：
+- 不分配 smem
+- 不触发 bank conflict
+- 不需要 syncthreads（warp 内天然同步）
+- 延迟 ~1 cycle（寄存器→寄存器）
+
+vs smem + atomic：
+- smem 写入 20 cycles
+- atomic 串行 32 次 = 32 × 20 = 640 cycles
+- smem 读回 20 cycles
+- 合计 680 cycles，而 shuffle 只要 5 cycles
+
+**📍 代码映射**（[knn_search_kernel.cu:80-88](file:///home/sti/Documents/trae_projects/cv/project_expe/cuda_project/src/knn_search_kernel.cu)）：
+
+```cpp
+// 第 1 级归约：warp shuffle 在 warp 内找最小
+for (int offset = 16; offset > 0; offset >>= 1) {
+    float otherDist = __shfl_xor_sync(0xffffffff, bestDist, offset);
+    int  otherIdx  = __shfl_xor_sync(0xffffffff, bestIdx, offset);
+    if (otherDist < bestDist) {
+        bestDist = otherDist;
+        bestIdx = otherIdx;
+    }
+}
+// 5 轮后，warp 内 32 线程的 bestDist 都是本 warp 的最小值
+```
+
+逐行解读：
+- `0xffffffff` = 全 warp（32 线程）都参与
+- `__shfl_xor_sync(mask, val, offset)` = 把自己 val 发给 lane^(offset) 的线程，同时收到 lane^(offset) 的 val
+- `offset=16` 时：lane 0 收到 lane 16 的，lane 1 收到 lane 17 的...两两配对取小
+- 5 轮后所有 lane 都拿到 warp 的全局最小
+
+**🎯 但我们 block 有 256 线程 = 8 个 warp，怎么跨 warp 归约？**
+
+这是 shuffle 的限制——**shuffle 只在 warp 内（32 线程）有效，跨 warp 必须走 smem**。
+
+代码用**两级归约**：
+
+```
+256 线程 = 8 个 warp
+级 1：每个 warp 内 shuffle 归约 → 得到 8 个 warp 最小值
+       ↓ lane 0 写到 smem warpBestDist[warpId]
+级 2：warp 0 把 8 个值载入自己的 lane（lane<8 才有数据）
+       再做一次 shuffle 归约 → 1 个全局最小值
+       ↓ lane 0 写回 global
+```
+
+看 [knn_search_kernel.cu:90-110](file:///home/sti/Documents/trae_projects/cv/project_expe/cuda_project/src/knn_search_kernel.cu)：
+
+```cpp
+// 第 1 级归约后，每个 warp 的 lane 0 持有本 warp 最小值
+if (lane == 0) {
+    warpBestDist[warpId] = bestDist;   // 8 个 warp 各写一个
+    warpBestIdx[warpId]  = bestIdx;
+}
+__syncthreads();
+
+// 第 2 级：warp 0 把 8 个值搬进自己的 lane
+if (warpId == 0) {
+    float myDist = (lane < 8) ? warpBestDist[lane] : 1e30f;
+    int  myIdx  = (lane < 8) ? warpBestIdx[lane]  : -1;
+    // 再做一次 warp shuffle
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        ...
+    }
+    if (lane == 0) {   // warp 0 lane 0 = 全局最小
+        outDists[q] = myDist;
+        outIndices[q] = myIdx;
+    }
+}
+```
+
+**⚠️ 工程坑（我们踩过）**：
+- 旧版 bug：只做 warp 0 的 shuffle，没做跨 warp 归约 → 8 个 warp 只有 warp 0 的结果对，其他 7 个 warp 的最小值丢了
+- 修复：加 smem 中转 + 第 2 级 shuffle，8 个 warp 都参与
+
+**🎯 性能对比**：
+
+| 方式 | 步数 | 周期 |
+|------|------|------|
+| smem + atomic | 32 次串行 | 680 cycles |
+| warp shuffle（1 级）| 5 步并行 | 5 cycles |
+| 两级 shuffle（256 线程）| 5 + 5 = 10 步 | ~30 cycles（含 smem 中转）|
+
+**🚀 迁移场景**：
+- LLM attention 的 softmax reduce-sum：FlashAttention row-wise reduction 就是这套
+- 任何 reduce（sum/max/min）算子都这么写
+- 经典 CUDA reduce 算子模板
+
+---
+
 ### 3.1 Shared Memory Tiling（分块复用）
 
 #### 🏠 生活类比：工地协作
