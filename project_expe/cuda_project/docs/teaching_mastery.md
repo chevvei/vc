@@ -991,21 +991,78 @@ if (cellId >= 0) atomicAdd(&cellCounts[cellId], 1);   // L43
 
 **工程取舍（面试考点）**——atomic 的代价模型 = 同地址串行：
 
-| 场景 | 冲突程度 | 对策 |
-|------|----------|------|
-| 点云均匀（本项目，100 万点散在百万格） | 极少 | 直接 atomic，够了 |
-| 点云聚集（如桌面扫描堆在几个格） | 100 万次撞同一地址 | 必须优化 |
-| 极端热点 | 退化串行 | 换数据结构 |
+| 场景                                   | 冲突程度           | 对策              |
+| -------------------------------------- | ------------------ | ----------------- |
+| 点云均匀（本项目，100 万点散在百万格） | 极少               | 直接 atomic，够了 |
+| 点云聚集（如桌面扫描堆在几个格）       | 100 万次撞同一地址 | 必须优化          |
+| 极端热点                               | 退化串行           | 换数据结构        |
 
 优化路径（由轻到重）：
 1. **warp 内预合并**：warp 里多个线程撞同一 cell 时，先用 shuffle/reduce 合并成一次请求，再发一次 atomic
 2. **smem 局部计数**：block 内各 cell 先在 shared memory 计数，block 结束统一 flush 到 global——把上千次 atomic 压成几十次（counting sort 的标准套路）
 3. **细化 cell**：格子更小 → 点更散 → 冲突自然少（代价：cell 数量平方增长，scan/sort 变贵）
 
+##### 深挖：smem 局部 reduce 具体怎么做（白板方案）
+
+**思路**：global atomic 要跑到 L2（全 GPU 共享，所有 SM 在那排队）。给每个 block 发一块**白板（shared memory）**，块内先自己记，块结束统一汇报一次。
+
+```
+无优化（现状）：
+  100 万线程 ──每点 1 次──▶ L2 原子单元（全 GPU 在这排队）
+
+smem 优化后：
+  Block 0（256 线程）              Block 1（256 线程）
+  ┌ smem 白板 counts ┐            ┌ smem 白板 counts ┐
+  │ 256 次 smem atomic│            │ 256 次 smem atomic│  ← SM 内部解决，不出芯片
+  └────────┬─────────┘            └────────┬─────────┘
+           │ block 结束：每格 1 次 global atomic
+           └──────────▶ L2 ◀──────────────┘
+```
+
+```cpp
+__global__ void countCellsSmem(...) {
+    __shared__ int smemCounts[NUM_CELLS];   // 块私有白板
+    for (int i = tid; i < NUM_CELLS; i += blockDim.x)
+        smemCounts[i] = 0;                   // 线程合作清零
+    __syncthreads();
+
+    if (cellId >= 0) atomicAdd(&smemCounts[cellId], 1);  // 块内计数
+
+    __syncthreads();
+    for (int i = tid; i < NUM_CELLS; i += blockDim.x)    // 块末 flush
+        if (smemCounts[i] > 0)
+            atomicAdd(&cellCounts[i], smemCounts[i]);    // 一次汇报总数
+}
+```
+
+**为什么 smem atomic 快**：smem atomic 在 **SM 自己内部**执行，不出芯片去 L2；不同 SM 的白板互不相干 → 竞争域从"全 GPU 所有 SM"缩小到"本 block 256 人"。
+
+**收益算账**（面试点）——把"每点一次"变成"每块每格一次"，收益正比于聚集度：
+
+| 场景 | global atomic 次数 | smem 后 | 收益 |
+|------|-------------------|---------|------|
+| 均匀：256 点散在 256 个不同 cell | 256 | flush 仍 256 次（每格计数 1） | 无收益也无损失 |
+| 聚集：256 点全挤同一 cell | 256 次撞同地址（串行灾难） | 256 次 smem + **1 次** global | **256 倍削减** |
+
+**⚠️ 坑：白板放不下怎么办**——smem 白板方案假设 `NUM_CELLS × 4B ≤ 164KB`。本项目 cell 数 = 100³ = 100 万个 int = **4MB，smem 根本放不下**。生产代码的真实解法是 **warp 聚合**（不需要白板）：
+
+```cpp
+unsigned mask = __match_any_sync(0xffffffff, cellId);  // warp 内谁跟我同 cell？
+int leader = __ffs(mask) - 1;                          // 组内最低 lane 当队长
+if (lane == leader)
+    atomicAdd(&cellCounts[cellId], __popc(mask));      // 队长一次加 N
+```
+
+32 人同 cell → 32 次 atomic 变 1 次。cub/thrust 的 histogram、生产级空间哈希都这么写。
+
+**本项目的取舍**：点云均匀 → 热点不存在 → 白板和聚合都是过度设计，直接 global atomic。面试话术："我知道怎么治热点，但我判断当前场景不值得治"——比"会这招就到处用"高一档。
+
 **面试讲法**：
+
 > "grid 计数用 atomicAdd，它是 GPU 上唯一安全的并发写，硬件在 L2 原子单元把同地址请求串行化。代价是热点 cell 会退化串行，标准优化是先在 smem/warp 内做局部归约，再合并成少量 global atomic，能把 atomic 次数压一个数量级。我们项目点云均匀，实测直接 atomic 就够，但我能讲清楚聚集场景的优化路径。"
 
 **❓ 自检**：
+
 - `++` 为什么不安全？→ 三条指令 LDG/IADD/STG，读和写之间会被插入别人的读
 - atomic 在硬件哪里执行？→ L2 原子单元，同地址排队串行，不同地址并行
 - 什么时候必须优化 atomic？→ 冲突地址数 × 请求频率高（点聚集、hash 桶少）
@@ -1015,6 +1072,7 @@ if (cellId >= 0) atomicAdd(&cellCounts[cellId], 1);   // L43
 **为什么不能写 `for` 循环**：`starts[i] = starts[i-1] + counts[i-1]` 是 **O(N) 依赖链**，每步等上一步。GPU 有一万个线程也只能干瞪眼——**串行依赖和 bank conflict 并列 GPU 两大天敌**。
 
 **并行 scan 思想**（Blelloch）：log₂(N) 轮，每轮 N/2 线程同时工作：
+
 - **up-sweep**（向上收集）：相邻配对求和，像倒着的金字塔
 - **down-sweep**（向下分发）：把前缀和分发回每个位置
 - 总深度 O(log N)，work-efficient 版总工作量 O(N)
@@ -1035,15 +1093,18 @@ cub::DeviceScan::ExclusiveSum(tempBuf, tempBytes, cellCounts, cellStarts, n, str
 **这是所有 `cub::Device*` API 的通用套路**（size-query then run）。为什么这么设计：不同输入规模/数据分布需要的 temp 不同，库不替你管内存，让你自己分配复用。
 
 **exclusive vs inclusive**（易错）：
+
 - exclusive：`out[i] = sum(in[0..i-1])`，不含自己 → **cellStart 要这个**（起始位置 = 前面所有人总数）
 - inclusive：`out[i] = sum(in[0..i])`，含自己 → 用它做 start 会差一位
 
 **工程取舍**：本项目每次 build 都 `cudaMalloc(tempBytes)` 再 free——**教学简化**。工程正确做法：temp buffer 按最大规模**一次分配、缓存复用**。`cudaMalloc` 有隐式同步 + 分配开销，高频调用是性能大忌（尤其放在每帧调用的 build 里）。
 
 **面试讲法**：
+
 > "cell 起始位置用 cub 的 exclusive scan。串行 scan 是 O(N) 依赖链，GPU 上必死；cub 的 Blelloch work-efficient scan 是 O(log N) 深度 O(N) 工作量。cub 的 API 是两段式：第一次传 nullptr 查 temp 大小，第二次真跑。temp buffer 工程上要缓存复用，别每帧 malloc。"
 
 **❓ 自检**：
+
 - 串行 scan 为什么 GPU 上慢？→ O(N) 依赖链，每步等上一步，并行度 1
 - cub 为什么调用两次？→ 第一次 size-query 算 temp 大小，第二次执行——所有 Device* API 通用
 - cellStart 用 exclusive 还是 inclusive？→ exclusive，start = 前面的总数不含自己
@@ -1051,6 +1112,7 @@ cub::DeviceScan::ExclusiveSum(tempBuf, tempBytes, cellCounts, cellStarts, n, str
 #### 📕 故事 3 深挖：Radix Sort —— GPU 为什么抛弃比较排序
 
 **比较排序（快排/归并）在 GPU 上的三宗罪**：
+
 1. O(N log N) 次比较，比较次数比 radix 的线性扫描多
 2. 分支发散：比较结果不一致 → warp 内走岔路（对照阶段 5 的 if 危害）
 3. 不规则访存：partition 交换地址乱跳，cache line 全废
@@ -1079,14 +1141,17 @@ cub::DeviceRadixSort::SortPairs(temp, tempBytes,
 **为什么这条链自洽**：count（atomic）→ scan（cub）→ sort（radix 内部又是 count+scan+scatter）——**空间索引构建 = 并行原语的接力**。这就是面试官想听的"体系化理解"。
 
 **工程取舍**：
+
 - `thrust::sort_by_key` 一行也能排（int key 内部也走 radix），为什么直接用 cub：省一层迭代器抽象、temp/stream 全可控；thrust 本身就是 cub 的封装
 - `begin_bit=0, end_bit=32`：只按 32 位全位排序；若 key 范围小（如 cellId < 65536）可只排 16 位，**快一倍**——免费优化
 - SortPairs **不支持 input==output 别名**（代码注释里标了）——in-place 需求要用双缓冲换着排
 
 **面试讲法**：
+
 > "按 cellId 排序用 cub radix sort。GPU 不用比较排序：O(N log N) 比较 + 分支发散 + 不规则访存三宗罪；radix 4 pass 8-bit 分桶，每 pass 就是 count+scan+scatter，全是规则访存。key-value pair 排完后同 cell 点连续，查询端切连续区间，合并访存闭环。key 范围小的时候可以截断位数白拿一倍加速。"
 
 **❓ 自检**：
+
 - GPU 为什么不用快排？→ 比较发散 + 不规则访存 + O(N log N) 比较
 - 32-bit key 排几次？→ 4 次（每 pass 处理 8 bit）
 - sort 之后哪里闭环了前面的优化？→ 同 cell 连续 → 查询合并访存（阶段 4 的布局思想在索引结构上重现）
@@ -1128,6 +1193,7 @@ cellIds[i] = (cellId >= 0) ? cellId : totalCells;  // 哨兵 key，排序后天�
 越界点 key 设为 totalCells（比一切合法 cellId 大）→ 排序后聚在末尾，任何合法查询区间都碰不到，且**不干扰**合法 cell 的相对位置。
 
 **工程教训**：
+
 1. "同一个语义在两处代码各自判断"= bug 温床（这里两处各自处理 `cellId >= 0`）
 2. 边界条件（越界输入）必须进测试用例——正常数据测一万次也抓不到这个 bug
 3. 哨兵值（sentinel）是处理"异常元素参与排序"的标准手法
@@ -1140,9 +1206,13 @@ cellIds[i] = (cellId >= 0) ? cellId : totalCells;  // 哨兵 key，排序后天�
 
 1000 个志愿者要统计 100 万个包裹分别进了哪个仓库（cell）。每个仓库有个计数器。
 
-**串行**：一个人挨个点 → 100 万次，慢。
+**串行**：1 人点完全部 100 万件 → 100 万次操作。
 
-**并行 + atomic**：1000 人同时点，每人看到包裹就给对应仓库的计数器 +1。但计数器是共享的，多人同时往同一仓库 +1 会冲突。
+**并行 + atomic**：1000 人**分包裹**，每人 1000 件（总共还是 100 万件，不是每人 100 万）。GPU 版更极端：100 万线程，每人只管自己那 1 个点。
+- 看包裹、算属于哪个仓库 → **并行**（各算各的坐标，互不干扰）
+- 同一仓库计数器同时被多人 +1 → **硬件强制排队，一次一个**——这才是 atomic 的"串行"，不是整个统计变串行
+
+**检票口比喻**：音乐节 100 个入口。你走 3 号口、我走 7 号口，互不等待（不同地址的 atomic 完全并行）；同时冲向 3 号口就得排队（同一地址的 atomic 串行）。
 
 **atomicAdd**：硬件保证"读-改-写"是原子的，不会丢更新。
 
