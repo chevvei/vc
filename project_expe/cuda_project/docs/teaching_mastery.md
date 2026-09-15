@@ -21,6 +21,7 @@
 - **GPU（万人军团）**：10000 个普通士兵，每人力量一般，只会执行简单指令。但一声令下 10000 人同时搬，1 趟搞定。
 
 **核心区别**：
+
 - CPU：少而精，强在**单线程性能**和**复杂逻辑**
 - GPU：多而广，强在**数据并行吞吐**
 
@@ -28,13 +29,13 @@
 
 #### 📖 硬件事实
 
-| | CPU | GPU |
-|---|---|---|
-| 核心数 | 4-16 | 数千 |
-| 单核性能 | 极强 | 一般 |
-| 缓存 | L1/L2/L3 多级，大 | L1/L2，小 |
+|          | CPU                      | GPU            |
+| -------- | ------------------------ | -------------- |
+| 核心数   | 4-16                     | 数千           |
+| 单核性能 | 极强                     | 一般           |
+| 缓存     | L1/L2/L3 多级，大        | L1/L2，小      |
 | 控制单元 | 大（分支预测、乱序执行） | 小（锁步执行） |
-| ALU 占比 | ~20% | ~80% |
+| ALU 占比 | ~20%                     | ~80%           |
 
 > **记住**：GPU 芯片面积 80% 是 ALU（算术逻辑单元），CPU 只有 20%。GPU 把控制电路的面积省下来全做成计算单元。这就是"万人军团"的物理来源。
 
@@ -54,9 +55,7 @@ GPU 的线程有严格的编制，像军队一样：
 **关键约束**（这是所有优化的根因）：
 
 1. **Warp（班）是执行的基本单位**：32 个线程必须执行**完全相同的指令**。如果 if/else 让 32 人走不同路，就有一半人闲着（warp divergence）。
-
 2. **Block（团）内可以通信**：同一个 block 的线程可以共享 shared memory，可以用 `__syncthreads()` 同步。
-
 3. **Grid（军队）内 block 之间不能通信**：不同 block 之间没有同步机制，只能通过 global memory 间接通信。
 
 #### 🎯 为什么 warp 是 32？
@@ -79,12 +78,12 @@ GPU 的 SIMT（Single Instruction Multiple Thread）调度器一次发射 32 条
 
 **延迟对比**（这是所有内存优化的根因）：
 
-| 层级 | 延迟（cycles） | 容量 | 谁能用 |
-|------|----------------|------|--------|
-| 寄存器 Register | ~1 | 每线程几十个 | 每线程私有 |
-| 共享内存 Shared Memory | ~20 | 每 SM 48-164KB | 同 block 共享 |
-| L1/L2 缓存 | ~30-100 | 几百 KB | 硬件自动管理 |
-| 全局内存 Global | ~400-800 | 几 GB | 所有线程 |
+| 层级                   | 延迟（cycles） | 容量           | 谁能用        |
+| ---------------------- | -------------- | -------------- | ------------- |
+| 寄存器 Register        | ~1             | 每线程几十个   | 每线程私有    |
+| 共享内存 Shared Memory | ~20            | 每 SM 48-164KB | 同 block 共享 |
+| L1/L2 缓存             | ~30-100        | 几百 KB        | 硬件自动管理  |
+| 全局内存 Global        | ~400-800       | 几 GB          | 所有线程      |
 
 > **记住这张表**。后面所有优化都在解决同一个问题：**怎么让数据从 global 搬到 shared/register 再算，而不是反复跑 global**。
 
@@ -95,6 +94,7 @@ GPU 有数千核心，如果都在等 global memory，就像万人军团都在�
 GPU 的 global memory 带宽约 1-2 TB/s（A100 约 2TB/s）。听起来很大，但 10000 个线程同时要数据，每个线程分到的带宽很有限。
 
 **所以所有优化的核心逻辑**：
+
 1. 减少访问 global 的次数（tiling 复用、kernel fusion）
 2. 每次访问尽量高效（合并访存、bank conflict 规避）
 3. 能用 shared/register 就不用 global
@@ -155,14 +155,15 @@ CUDA 里：
 
 ### 0.4.4 极简关系汇总
 
-| 概念 | 位置 | 属性 | 速度 | 容量 |
-|------|------|------|------|------|
-| **片上 on-chip** | GPU 硅晶片 die 内部 | Register / Shared Memory / L1 / L2 | 快 | 小 |
-| **片外 off-chip** | PCB 板上 GDDR 显存 | Global Memory | 慢 | 大 |
-| **SM** | 片上真实硬件 | 硅片上蚀刻的处理器单元 | — | — |
-| **Block** | 软件逻辑分组 | 代码里定义的线程组，不是硬件 | — | — |
+| 概念                    | 位置                | 属性                               | 速度 | 容量 |
+| ----------------------- | ------------------- | ---------------------------------- | ---- | ---- |
+| **片上 on-chip**  | GPU 硅晶片 die 内部 | Register / Shared Memory / L1 / L2 | 快   | 小   |
+| **片外 off-chip** | PCB 板上 GDDR 显存  | Global Memory                      | 慢   | 大   |
+| **SM**            | 片上真实硬件        | 硅片上蚀刻的处理器单元             | —   | —   |
+| **Block**         | 软件逻辑分组        | 代码里定义的线程组，不是硬件       | —   | —   |
 
 调度规则：
+
 1. 一个 Block **整体分配到某一个 SM 上运行**；Block 不能跨 SM 拆分。
 2. Shared Memory 属于 SM 硬件资源；同一 block 内线程共享这块 SM 上的 shared memory。
 3. 不同 block 之间**无法互相访问 shared memory**（即使同驻一个 SM）。
@@ -225,11 +226,11 @@ CUDA 里：
 
 #### 🚫 容易踩坑的误区
 
-| 误区 | 正解 |
-|------|------|
-| ❌ 每个 block 自带一块独立物理 SRAM | ✅ 物理硬件只有**一整块 SRAM 在 SM 里**，是划分空间，逻辑隔离 |
-| ❌ 同一个 SM 上多个 block 可以互相读写对方 shared | ✅ 不行！硬件隔离，互相不可见。shared 内存**作用域只在本 block** |
-| ❌ shared 是动态 malloc，运行时随便申请大小 | ✅ 不是。`__shared__` 大小编译期固定，硬件提前算好一个 block 占多少 shared |
+| 误区                                              | 正解                                                                         |
+| ------------------------------------------------- | ---------------------------------------------------------------------------- |
+| ❌ 每个 block 自带一块独立物理 SRAM               | ✅ 物理硬件只有**一整块 SRAM 在 SM 里**，是划分空间，逻辑隔离          |
+| ❌ 同一个 SM 上多个 block 可以互相读写对方 shared | ✅ 不行！硬件隔离，互相不可见。shared 内存**作用域只在本 block**       |
+| ❌ shared 是动态 malloc，运行时随便申请大小       | ✅ 不是。`__shared__` 大小编译期固定，硬件提前算好一个 block 占多少 shared |
 
 ---
 
@@ -246,18 +247,23 @@ CUDA 里：
 ### 0.4.8 ❓ 自测
 
 **Q1**：多个 block 能不能放到同一个 SM 上？
+
 > 可以，SM 资源够的话，可以加载多个 block，分时调度 warps。但是这些 block 各自独立，不能互访 shared memory。
 
 **Q2**：shared memory 是每个 block 单独分配一块物理 SRAM 吗？
+
 > 不是。SM 有一块物理 shared SRAM。block 占用一部分，block 执行完就释放，供下一个 block 复用。
 
 **Q3**：同一个 SM 上两个 block，能通过 shared memory 互相传数据吗？
+
 > 不能。shared 的作用域仅限 block 内部。block 之间通信只能走全局显存 Global Memory。
 
 **Q4**：为什么 block 声明的 shared 越大，occupancy 越低？
+
 > SM 的 shared SRAM 总量固定（如 Ampere 164KB）。一个 block 要 32KB → 同 SM 最多 5 个 block；要 80KB → 最多 2 个。block 数量少 = 同时驻留的 warp 少 = occupancy 低。
 
 **Q5**：Block 能不能跨 SM 拆分？
+
 > 不能。一个完整 block 必须全部跑在同一个 SM 上，这是硬件规则。
 
 ---
@@ -271,11 +277,13 @@ CUDA 里：
 你从北京发货到上海仓库（GPU）：
 
 **普通内存（pageable）**：
+
 - 货物散放在老百姓家里，操作系统随时可能把货搬到别处（换页）
 - 快递员来收货，发现"这家的货被搬走了"，要先找到、集中到中转站
 - 多一道"找货+集中"的手续
 
 **Pinned memory（锁页）**：
+
 - 货物锁在中转站，操作系统保证不动它
 - 快递员来直接装车，省一道手续
 - DMA（直接内存访问）引擎直接拿地址搬运
@@ -318,10 +326,12 @@ cudaFreeHost(hCloud);  // 不能用 free()
 #### 🏠 生活类比：流水线收费站
 
 **同步搬运**：
+
 - 卡车发货（cudaMemcpy H2D），你在收费站等它到上海卸完货才回来
 - 等待期间你（CPU）和加工线（GPU kernel）都闲着
 
 **异步搬运**：
+
 - 卡车自己跑（cudaMemcpyAsync），你立刻去准备下一批货或启动加工
 - 用 CUDA stream 把"搬运"和"计算"放不同队列，可以并行
 
@@ -333,10 +343,13 @@ cudaFreeHost(hCloud);  // 不能用 free()
 #### 🎯 为什么需要
 
 数据搬运（H2D）和计算（kernel）是两个独立操作。如果同步执行：
+
 ```
 搬运 5ms → 计算 10ms → 搬运 5ms → 计算 10ms = 30ms
 ```
+
 异步 pipeline：
+
 ```
 搬运 5ms ──→ 计算 10ms
             搬运 5ms ──→ 计算 10ms  = 20ms（重叠了搬运和计算）
@@ -380,10 +393,12 @@ otherKernel<<<grid, block, 0, stream2>>>(otherDevPtr);
 你有 100 万个包裹，每个包裹有长宽高三个属性。
 
 **AoS（Array of Struct，结构体数组）**：
+
 - 货架上摆 `[长1, 宽1, 高1, 长2, 宽2, 高2, ...]`
 - 想取所有"长"？要隔 3 个拿一个，跑来跑去
 
 **SoA（Struct of Array，数组结构体）**：
+
 - 分三个货架：长货架 `[长1, 长2, ...]`、宽货架、高货架
 - 想取所有"长"？一个货架顺序拿，一趟搞定
 
@@ -402,17 +417,20 @@ CloudSoA cloud;        // x[0], x[1], x[2]... y[0], y[1]...
 #### 🎯 为什么 SoA 在 GPU 上快
 
 这要回到 warp 的工作方式。warp 内 32 个线程**同时**访问内存：
+
 - 线程 0 访问 `cloud[0].x`，线程 1 访问 `cloud[1].x`...
 - AoS：`cloud[0].x` 在地址 0，`cloud[1].x` 在地址 12（每个 Point 12 字节）
 - 32 线程访问的地址间隔 12 字节，**不连续**，不是一次 128B 事务能覆盖的
 
 SoA：
+
 - 线程 0 访问 `x[0]`，线程 1 访问 `x[1]`...
 - 地址连续：0, 4, 8, 12... 32 线程访问 128 字节连续区间
 
 #### ⚙️ 合并访存（Coalesced Access）
 
 GPU 的 global memory 控制器一次处理 **128 字节**事务。32 个线程（每线程 4 字节 float）正好 128 字节：
+
 - **合并**：32 线程访问连续 128B → 1 次事务，带宽利用率 100%
 - **非合并**：32 线程访问散乱地址 → 可能 32 次事务，带宽利用率 3%
 
@@ -517,11 +535,13 @@ __shared__ float buf[1024 + 1];  // padding 1 个元素
 
 **❓ tiling 是不是"分块"？**
 ✅ **是。但比普通的"分块"更精确**：
+
 - "分块"是结果——把 10000 个点切成 10 个 1024 大小的 tile
 - "tiling"是机制——**block 内 256 线程协作把一个 tile 从 global 搬到 smem，让 256 个线程共享这 1024 个点**
 - 关键不在"切"，而在"**协作搬运 + 块内复用**"——这才是 tiling 的工程本质
 
 **🔧 硬件事实（为什么能省 4 倍）**：
+
 1. global → smem 一次搬 1024 个点 = 256 线程 × 每线程搬 1 个 = 256 次合并访存（1 个 cache line 搬 32 个 float，刚好 8 个事务）
 2. 搬到 smem 后，**256 个线程都从 smem 读这 1024 个点**——读 smem 不走 global，免费
 3. 复用率 = tile_size / block_size = 1024 / 256 = **4 倍**：每点从 global 搬 1 次，被 4 个线程从 smem 读 4 次
@@ -549,6 +569,7 @@ for (size_t tileStart = 0; tileStart < cloudN; tileStart += blockDim.x) {
 ```
 
 **🎯 工程取舍**（tile 大小怎么选）：
+
 - tile 太小（如 32）：复用率 32/256<1，没省到，还多了 syncthreads 开销 → 慢
 - tile 太大（如 16384）：一个 block 的 smem 占用 = 16384×3×4B = 192KB，超出 SM 的 164KB 上限 → 跑不起来；即使跑起来，一个 SM 只能放 1 个 block → occupancy 暴跌
 - 我们选 256：tile = blockDim，一人搬一个，零冗余搬运；smem 占用 3KB，一个 SM 还能放 5+ 个 block，occupancy 健康
@@ -568,6 +589,7 @@ for (size_t tileStart = 0; tileStart < cloudN; tileStart += blockDim.x) {
 **3 种典型撞 bank 场景**：
 
 **场景 A：stride 访问（最经典坑）**
+
 ```cpp
 __shared__ float buf[1024];
 // 线程 i 访问 buf[i * 32]
@@ -579,6 +601,7 @@ float v = buf[threadIdx.x * 32];
 ```
 
 **场景 B：矩阵转置按列读**
+
 ```cpp
 __shared__ float mat[32][32];
 // 线程 i 读 mat[i][0] 的列
@@ -588,6 +611,7 @@ float v = mat[threadIdx.x][0];
 ```
 
 **场景 C：结构体数组放 smem**
+
 ```cpp
 struct Point { float x, y, z; };
 __shared__ Point pts[32];
@@ -620,25 +644,31 @@ __shared__ float buf[1025];
 **📍 我们项目里有 bank conflict 吗？**
 
 看 [knn_search_kernel.cu:35-37](file:///home/sti/Documents/trae_projects/cv/project_expe/cuda_project/src/knn_search_kernel.cu)：
+
 ```cpp
 float* tileX = smem;              // tileX[0..255]
 float* tileY = smem + blockDim.x; // tileY[0..255]
 float* tileZ = smem + 2*blockDim.x;
 ```
+
 访问模式：线程 tid 读 `tileX[tid], tileY[tid], tileZ[tid]`。
+
 - tid=0: tileX[0] @ bank 0, tileY[0] @ bank 0 (smem+256, 256*4=1024B, bank=(1024/4)%32=0)
 - tid=1: tileX[1] @ bank 1, tileY[1] @ bank 1
 
 **看起来 X/Y/Z 的 tid 都映射到同一 bank？** 实际不会冲突，因为**访问是分时的**——dx/dy/dz 是三条独立 load 指令，每条指令下 32 线程读 tileX[0..31] 是连续 32 个 bank → 无冲突。三条指令顺序执行，互不干扰。
 
 **⚠️ 但归约阶段有潜在 conflict**：
+
 ```cpp
 float* warpBestDist = smem + 3 * blockDim.x;  // warpBestDist[8]
 int* warpBestIdx = (int*)(smem + 3*blockDim.x + blockDim.x/32);
 ```
+
 warp 0 的 32 线程读 `warpBestDist[lane]`（lane<8 才有数据，其余读 1e30f）。lane 0..7 各读不同 bank，lane 8..31 都读同一个 padding 值 1e30f——**这是广播，不算 conflict**（硬件优化了广播）。
 
 **🛠️ 怎么定位**：
+
 ```bash
 ncu --metrics shared_mem_utilization,l1_shared_memory_bank_conflicts ./cuda_spatial_accel
 # Nsight Compute Source 页面会标红冲突行
@@ -667,12 +697,14 @@ ncu --metrics shared_mem_utilization,l1_shared_memory_bank_conflicts ./cuda_spat
 **🔧 硬件本质（为什么不走 smem）**：
 
 `__shfl_xor_sync` 是一条**硬件指令**，让 warp 内线程直接读对方**寄存器**的值：
+
 - 不分配 smem
 - 不触发 bank conflict
 - 不需要 syncthreads（warp 内天然同步）
 - 延迟 ~1 cycle（寄存器→寄存器）
 
 vs smem + atomic：
+
 - smem 写入 20 cycles
 - atomic 串行 32 次 = 32 × 20 = 640 cycles
 - smem 读回 20 cycles
@@ -694,6 +726,7 @@ for (int offset = 16; offset > 0; offset >>= 1) {
 ```
 
 逐行解读：
+
 - `0xffffffff` = 全 warp（32 线程）都参与
 - `__shfl_xor_sync(mask, val, offset)` = 把自己 val 发给 lane^(offset) 的线程，同时收到 lane^(offset) 的 val
 - `offset=16` 时：lane 0 收到 lane 16 的，lane 1 收到 lane 17 的...两两配对取小
@@ -740,18 +773,20 @@ if (warpId == 0) {
 ```
 
 **⚠️ 工程坑（我们踩过）**：
+
 - 旧版 bug：只做 warp 0 的 shuffle，没做跨 warp 归约 → 8 个 warp 只有 warp 0 的结果对，其他 7 个 warp 的最小值丢了
 - 修复：加 smem 中转 + 第 2 级 shuffle，8 个 warp 都参与
 
 **🎯 性能对比**：
 
-| 方式 | 步数 | 周期 |
-|------|------|------|
-| smem + atomic | 32 次串行 | 680 cycles |
-| warp shuffle（1 级）| 5 步并行 | 5 cycles |
-| 两级 shuffle（256 线程）| 5 + 5 = 10 步 | ~30 cycles（含 smem 中转）|
+| 方式                     | 步数          | 周期                       |
+| ------------------------ | ------------- | -------------------------- |
+| smem + atomic            | 32 次串行     | 680 cycles                 |
+| warp shuffle（1 级）     | 5 步并行      | 5 cycles                   |
+| 两级 shuffle（256 线程） | 5 + 5 = 10 步 | ~30 cycles（含 smem 中转） |
 
 **🚀 迁移场景**：
+
 - LLM attention 的 softmax reduce-sum：FlashAttention row-wise reduction 就是这套
 - 任何 reduce（sum/max/min）算子都这么写
 - 经典 CUDA reduce 算子模板
@@ -858,11 +893,13 @@ __global__ void knnSmemTiling(
 32 个人站成一圈，每人手里有一个数字。要找 32 个数中的最小值。
 
 **朴素做法（smem + atomic）**：
+
 - 每人把数字写到工位白板（shared memory）
 - 一个一个比较取最小（串行 atomic min）
 - 慢：32 次白板读写 + 串行
 
 **Warp shuffle 做法**：
+
 - 第 1 轮：每人转头看**对面那个人**的数字，取小的留下（32→16 个不同值）
 - 第 2 轮：再看更近的人（16→8）
 - 第 3 轮：8→4
@@ -888,10 +925,10 @@ float other = __shfl_xor_sync(0xffffffff, myVal, mask);
 
 #### 🎯 为什么快
 
-| 方式 | 步骤 | 访问 |
-|------|------|------|
-| smem + atomic | 串行 | smem 读写 ~20 cycles × 32 |
-| warp shuffle | 5 步并行 | 寄存器交换 ~1 cycle × 5 |
+| 方式          | 步骤     | 访问                       |
+| ------------- | -------- | -------------------------- |
+| smem + atomic | 串行     | smem 读写 ~20 cycles × 32 |
+| warp shuffle  | 5 步并行 | 寄存器交换 ~1 cycle × 5   |
 
 #### ⚙️ 怎么做
 
@@ -965,6 +1002,7 @@ atomic 是 GPU 上唯一安全的并发写方式，但**同一地址的 atomic �
 100 万人按"属于哪个仓库"排队。同仓库的人要挨着站，每个仓库的起始位置要知道。
 
 **三步构建 uniform grid**：
+
 1. **计数**：每个 cell 多少点（atomic，上面讲了）
 2. **前缀和**（exclusive scan）：算每个 cell 在排序后数组中的起始位置
 3. **排序**：按 cellId 排序，同 cell 的点挨着存
@@ -1039,13 +1077,14 @@ cub::DeviceRadixSort::SortPairs(
 
 #### 🎯 为什么有效
 
-| 操作 | 延迟 |
-|------|------|
+| 操作               | 延迟        |
+| ------------------ | ----------- |
 | global memory 读写 | ~400 cycles |
-| 寄存器访问 | ~1 cycle |
-| kernel launch | ~5 us |
+| 寄存器访问         | ~1 cycle    |
+| kernel launch      | ~5 us       |
 
 融合后：
+
 1. 省掉 global 读写（400x 差异）
 2. 省掉 kernel launch 开销
 
@@ -1060,11 +1099,11 @@ writeBackKernel<<<...>>>();     // 读 global，写 global
 // 融合：1 个 kernel
 __global__ void fusedEsdfPass(SeedCode* seeds, float* dists, ...) {
     int cell = blockIdx.x * blockDim.x + threadIdx.x;
-    
+  
     // 中间结果全在寄存器
     float bestDist = 1e30f;
     SeedCode bestSeed = -1;
-    
+  
     for (int dz = -1; dz <= 1; ++dz)
     for (int dy = -1; dy <= 1; ++dy)
     for (int dx = -1; dx <= 1; ++dx) {
@@ -1099,6 +1138,7 @@ __global__ void fusedEsdfPass(SeedCode* seeds, float* dists, ...) {
 **暴力**：每个格子挨个查所有医院 → 64³ × N 医院 = 天文数字。
 
 **Jump Flooding（烽火台）**：
+
 - 初始：只有医院格子知道自己在哪（有种子）
 - 第 1 轮：每个格子问 26 个邻居中**距离 32 格**的，谁有种子？有就抄来
 - 第 2 轮：问距离 16 格的邻居...
@@ -1117,6 +1157,7 @@ Jump Flooding 算法：从种子点（障碍）开始，多 pass 跳跃传播，
 - Jump Flooding：O(V × 26 × log(N))，26 邻居 × log(N) pass
 
 64³ 体素、1 万障碍：
+
 - 暴力：64³ × 10000 = 26 亿次
 - Jump Flooding：64³ × 26 × 14 ≈ 1.5 亿次
 
@@ -1216,6 +1257,7 @@ cudaGraphLaunch(graphExec, stream);
 **Occupancy = 活跃 warp 数 / SM 最大 warp 数**
 
 影响因子：
+
 1. **寄存器用量**：每个线程用的寄存器越多，一个 SM 能塞的线程越少
 2. **shared memory 用量**：同理
 3. **block size**：block 内线程数
@@ -1318,23 +1360,23 @@ printf("Kernel time: %.3f ms\n", ms);
 
 ## 全局总结：4 个矛盾 → 16 个优化点
 
-| 矛盾 | 优化点 | 一句话根因 |
-|------|--------|-----------|
-| 数据搬运 | Pinned memory | pageable 要中转拷贝，pinned 让 DMA 直连 |
-| 数据搬运 | Async copy + stream | 同步搬运让 CPU 和 GPU 都等，异步让搬运计算重叠 |
-| 内存布局 | AoS → SoA | GPU 一次 128B 事务，AoS 地址散乱，SoA 连续 |
-| 内存布局 | __restrict__ | 告诉编译器无别名，允许 load 重排到 store 前 |
-| 并行调度 | Shared memory tiling | global 延迟 400 cycles，smem 20 cycles，复用 N 倍 |
-| 并行调度 | Bank conflict 规避 | smem 分 32 bank，撞 bank 串行 32 倍 |
-| 并行调度 | Warp shuffle | 寄存器级数据交换，5 步归约 32 数，无 smem 读写 |
-| 空间索引 | Atomic counter | GPU 上唯一安全并发写，同地址串行 |
-| 空间索引 | cub scan/sort | 官方 work-efficient 原语，别造轮子 |
-| 算子协作 | Jump flooding | log(N) pass 传播，O(V×26×logN) vs 暴力 O(V×N) |
-| 算子协作 | Kernel fusion | global 400 cycles vs 寄存器 1 cycle，中间结果寄存器化 |
-| 算子协作 | CUDA Graph | 多 pass 固定流程一次提交，省 launch 开销 |
-| 工程质量 | Occupancy 调优 | 寄存器/smem 用量影响活跃 warp 数，影响延迟掩盖 |
-| 工程质量 | 数值稳定性 | Kahan 补偿浮点累加丢的小数 |
-| 工程质量 | Benchmark 自动化 | CUDA Event 精确计时 + 表格输出对比 |
+| 矛盾     | 优化点               | 一句话根因                                            |
+| -------- | -------------------- | ----------------------------------------------------- |
+| 数据搬运 | Pinned memory        | pageable 要中转拷贝，pinned 让 DMA 直连               |
+| 数据搬运 | Async copy + stream  | 同步搬运让 CPU 和 GPU 都等，异步让搬运计算重叠        |
+| 内存布局 | AoS → SoA           | GPU 一次 128B 事务，AoS 地址散乱，SoA 连续            |
+| 内存布局 | __restrict__   | 告诉编译器无别名，允许 load 重排到 store 前           |
+| 并行调度 | Shared memory tiling | global 延迟 400 cycles，smem 20 cycles，复用 N 倍     |
+| 并行调度 | Bank conflict 规避   | smem 分 32 bank，撞 bank 串行 32 倍                   |
+| 并行调度 | Warp shuffle         | 寄存器级数据交换，5 步归约 32 数，无 smem 读写        |
+| 空间索引 | Atomic counter       | GPU 上唯一安全并发写，同地址串行                      |
+| 空间索引 | cub scan/sort        | 官方 work-efficient 原语，别造轮子                    |
+| 算子协作 | Jump flooding        | log(N) pass 传播，O(V×26×logN) vs 暴力 O(V×N)      |
+| 算子协作 | Kernel fusion        | global 400 cycles vs 寄存器 1 cycle，中间结果寄存器化 |
+| 算子协作 | CUDA Graph           | 多 pass 固定流程一次提交，省 launch 开销              |
+| 工程质量 | Occupancy 调优       | 寄存器/smem 用量影响活跃 warp 数，影响延迟掩盖        |
+| 工程质量 | 数值稳定性           | Kahan 补偿浮点累加丢的小数                            |
+| 工程质量 | Benchmark 自动化     | CUDA Event 精确计时 + 表格输出对比                    |
 
 ---
 
