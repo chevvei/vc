@@ -23,6 +23,22 @@
 //
 // __restrict__ 的作用：告诉编译器"这块内存没有别的指针别名指着"
 //   没有它，编译器必须假设 cxs 和 outDists 可能重叠，每次都得重新读写
+//
+// 💼 工程套路 ⑭：const T* __restrict__ 是 CUDA kernel 签名的行业标配
+//   零成本、纯收益：不改语义（程序员自己担保没有别名，违反是未定义行为）
+//   只帮编译器放开手脚。CPU C++ 也有同款关键字（C99 restrict / 编译器
+//   扩展 __restrict），但 GPU 上收益更大——GPU 内存延迟 ~400 周期，编译器敢把 global 读提升（hoist）出循环
+//   和敢不敢重排，实测能差 10%~30%。规矩：输入指针一律
+//   `const float* __restrict__`，输出指针裸 `float*`（有别名风险的地方
+//   绝不加——in/out 同 buffer 的算法加了就是埋雷）
+//
+// 💼 工程套路 ⑮：profile 驱动，不猜——本文件本身是反面教材的正面用法
+//   注意文件头的"教学点"说 SoA 翻倍带宽，但深挖注释又指出本 kernel 是
+//   broadcast 模式、收益其实有限——这个"自相矛盾"是刻意的：
+//   教科书结论（SoA 快）≠ 本场景事实（broadcast 下差别小）。
+//   工程准则：任何布局/优化结论，用 ncu（sectors/req、dram throughput）
+//   实测说话，"我以为"在 GPU 上九成是错的。能讲清"教科书说什么、
+//   这里为什么不适用、拿什么指标验证"——这就是初级和资深的分界
 #include "pointcloud.h"
 #include <cuda_runtime.h>
 

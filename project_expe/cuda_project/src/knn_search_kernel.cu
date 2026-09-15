@@ -111,6 +111,13 @@ __global__ void knnSmemTilingKernel(
     //   offset=4 : → 4 个；offset=2 → 2 个；offset=1 → 1 个
     // 全程寄存器交换，零 smem、零 global，每步 1 条指令
     // dist 和 idx 必须绑在一起搬（比 dist 换 idx），否则答案张冠李戴
+    // 💼 工程套路 ⑩：__shfl_xor_sync 的 mask 参数为什么必须写全
+    //   mask=0xffffffff 表示"本 warp 32 线程全员参与"。Volta 起（IPS，
+    //   independent thread scheduling）线程可能各走各路，硬件靠 mask
+    //   知道"哪些线程会到齐"——mask 里没登记的线程参与交换时行为未定义。
+    //   老代码里的裸 __shfl_xor(...)（无 _sync 无 mask）是 pre-Volta 时代
+    //   遗物，新架构下多分支 kernel 里会炸。规则：新代码一律带全 mask 的
+    //   _sync 版；除非确认整个 warp 走完全相同的路径，才敢细化 mask
     for (int offset = 16; offset > 0; offset >>= 1) {
         float otherDist = __shfl_xor_sync(0xffffffff, bestDist, offset);
         int otherIdx = __shfl_xor_sync(0xffffffff, bestIdx, offset);
@@ -154,6 +161,26 @@ __global__ void knnSmemTilingKernel(
 }
 
 // host 侧包装
+//
+// 💼 工程套路 ⑧：block-per-query 的适用域（什么时候这版反而输）
+//   本版 block 数 = query 数。三个边界要心里有数：
+//   ① query 少（几百~几万）：好——每 block 256 线程吃满一个查询
+//   ② query 百万级：block 数百万，但每 block 并行度只有 256，
+//      "每查询全扫全云"的总工作量还是 O(Q×N)——若点云大，这类暴力版
+//      全输给空间索引版（uniform_grid 建好后只查邻近 cell，O(Q×邻居数)）
+//   ③ 1D grid 上限 2^31-1（CC≥3.0），query 千万级才会撞，一般不担心
+//   工程现实：点云配准/ICP 场景 query 通常几千~几十万，这版是甜点；
+//   如果要更通用，标准改法是"一个 block 循环处理多个 query"（grid-stride
+//   over queries），让 block 数固定、每 block 干多份活
+//
+// 💼 工程套路 ⑨：动态 smem 什么时候比静态 __shared__ 值得
+//   静态写法 `__shared__ float tileX[256];` 更简单，但大小编译期焊死。
+//   动态版的价值场景：
+//   ① 同一 kernel 想按数据规模换 tile 大小（小点云小 tile 省 smem →
+//      每 SM 能塞更多 block → occupancy 更高）
+//   ② smem 需求超过 48KB 默认上限（大 kernel 必须 dynamic + opt-in）
+//   教学准则：smem ≤48KB 且大小固定 → 静态（可读性优先）；
+//   要按 launch 参数伸缩或超 48KB → 动态 + cudaFuncSetAttribute
 void runKnnSmemTiling(
     const PointCloudSoA& cloud,
     const PointCloudSoA& queries,

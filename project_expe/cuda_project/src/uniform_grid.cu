@@ -116,6 +116,16 @@ void UniformGrid::free() {
 // ---------------------------------------------------------------------------
 // 构建 Uniform Grid 主流程（六步）
 // 数据流：cellCounts --scan--> cellStarts --sort--> sortedIndices
+//
+// 💼 工程套路 ①：错误检查
+//   本文件所有 cudaMalloc/kernel/cub 调用都没检查返回值——这是教学简化。
+//   生产代码每个 CUDA API 调用后必须跟 CUDA_CHECK(err) 宏（打文件名+行号），
+//   否则一个 launch 失败要等几万行之后才在别的错误里爆出来，定位成本天差地别。
+//   标准写法：
+//     #define CUDA_CHECK(x) do { cudaError_t e=(x); \
+//         if(e!=cudaSuccess){fprintf(stderr,"%s:%d %s\n",__FILE__,__LINE__, \
+//         cudaGetErrorString(e)); exit(1);} } while(0)
+//   调试期再加一步：kernel 后跟 CUDA_CHECK(cudaGetLastError()) 抓 launch 配置错。
 // ---------------------------------------------------------------------------
 void buildUniformGrid(
     const PointCloudSoA& cloud,   // SoA 布局点云（xs/ys/zs 三个独立数组）
@@ -139,11 +149,27 @@ void buildUniformGrid(
 
     // ---- 第 1 步：分配计数器并清零 ----
     // memsetAsync 走 stream，和后续 kernel 排队执行，不阻塞 CPU
+    //
+    // 💼 工程套路 ②：stream 的隐式顺序保证
+    //   注意全程没有插入任何 cudaStreamSynchronize——因为 memset 和
+    //   后续 kernel 都提交到同一条 stream，硬件保证按提交顺序执行。
+    //   "一条 stream = 一条先进先出的流水线"，这是免同步的关键。
+    //   反面写法：这里若用同步版 cudaMemset（走默认 stream），会阻塞
+    //   CPU 且可能引入不必要的全局同步点，流水线优势全丢。
+    //   唯一要 sync 的地方是函数最末尾取结果（见后）。
     cudaMalloc(&grid.cellCounts, totalCells * sizeof(int));
     cudaMemsetAsync(grid.cellCounts, 0, totalCells * sizeof(int), stream);
 
     // ---- 第 2 步：atomic 计数每个格子的点数 ----
+    // 💼 工程套路 ③：block size = 256 为什么是行业默认甜点
+    //   ① 256 是 32（warp）的整数倍 → 不产生残缺 warp（残废 warp 白占调度槽）
+    //   ② 寄存器压力温和：256 线程 × 每线程用 R 个寄存器，SM 64K 寄存器
+    //      文件够跑多个 block，occupancy 有保障
+    //   ③ smem 好切：256×4B = 1KB，tile 化时粒度合适
+    //   常见变体：128（寄存器重的 kernel）、512（smem 重、末级归约少一层）。
+    //   真正的答案是"用 launch bounds + profile 调"，但 256 是最稳的起点
     int threads = 256;
+    // 向上取整套路：(N + T - 1) / T —— 记住这个式子，CUDA 代码里出现频率极高
     int blocks = ((int)cloud.n + threads - 1) / threads;
     countCellsKernel<<<blocks, threads, 0, stream>>>(
         cloud.xs, cloud.ys, cloud.zs, cloud.n,
@@ -164,6 +190,19 @@ void buildUniformGrid(
     //
     // ⚠️ 工程化改造点：cudaMalloc/cudaFree 放在热路径（每帧 build）开销大
     // （隐式同步 + 分配器开销），生产代码应缓存 temp buffer 复用（诊断卡 14）
+    //
+    // 💼 工程套路 ④：cub temp buffer 池化（生产写法骨架）
+    //   把 tempBuf 提为类成员/全局资源，一次分配终身复用：
+    //     void* tempBuf = nullptr;  size_t tempCap = 0;   // 成员
+    //     // 每次 build 时：
+    //     size_t need = 0;
+    //     cub::DeviceScan::ExclusiveSum(nullptr, need, ...);
+    //     if (need > tempCap) { cudaFree(tempBuf);        // 只在不够时重配
+    //                            cudaMalloc(&tempBuf, need); tempCap = need; }
+    //   两条经验：
+    //   ① temp 需求随 N 增长很慢（对数级），"按历史最大值缓存"几乎不重配
+    //   ② 也可以顺带查 sort 的 temp 需求，取 max 共用一块——cub 各算法
+    //      的 temp buffer 语义相同（不透明暂存区），可共享不可并发共用
     cudaMalloc(&grid.cellStarts, totalCells * sizeof(int));
     size_t tempBytes = 0;
     cub::DeviceScan::ExclusiveSum(nullptr, tempBytes, grid.cellCounts, grid.cellStarts,
@@ -203,6 +242,20 @@ void buildUniformGrid(
     // 两段式：先查 temp 大小，再真跑
     // begin_bit=0, end_bit=32：按 32 位全位排序。
     // 工程优化：若 cellId < 65536，end_bit=16 只排 16 位，白拿一倍加速
+    //
+    // 💼 工程套路 ⑤：radix sort 的位域截断是免费午餐
+    //   radix 排序每 4~8 位一个 pass，pass 数 = 有效位数 / 位数每趟。
+    //   cellId 值域 = [0, totalCells)，本项目 100 万 < 2^20 → 只需 20 位，
+    //   写 end_bit=20 省掉 12 位 = 约 1/3 的 pass。
+    //   前提是值域有硬保证（越界点已用哨兵 totalCells 压住上限）。
+    //   这个套路泛化：任何"值域已知"的整数排序（点云 Morton 码、像素
+    //   颜色、哈希桶号）都值得先问一句"我到底有几位？"
+    //
+    // 💼 工程套路 ⑥：double buffer——cub sort 的 keys_in/keys_out 不能同址
+    //   下面用了 4 块 buffer（cellIds/sortedCellIds/idxIn/sortedIndices）。
+    //   生产写法常把 in/out 合并成一块 2N 的缓冲区取两半，省一半分配次数；
+    //   连续帧之间还可以 in/out 角色互换（ping-pong），零拷贝复用。
+    //   真实 GPU 引擎（粒子系统、光子映射）的排序阶段全是 ping-pong 双缓冲。
     size_t sortTempBytes = 0;
     cub::DeviceRadixSort::SortPairs(nullptr, sortTempBytes,
         cellIds, sortedCellIds,
@@ -220,5 +273,14 @@ void buildUniformGrid(
     cudaFree(sortedCellIds);
 
     // 等整条流水线排完（教学简化；生产可用 event/callback 做异步回调）
+    //
+    // 💼 工程套路 ⑦：结尾 sync 的三种生产替代
+    //   ① cudaEventRecord + cudaEventSynchronize：比 stream sync 粒度准
+    //      （只等 build，不等 stream 里更早的活），还能测耗时（elapsedTime）
+    //   ② cudaLaunchHostFunc / cudaStreamAddCallback：GPU 跑完回调 CPU，
+    //      CPU 线程完全解放（雷：回调里禁止调任何 CUDA API）
+    //   ③ 干脆不 sync：把 grid 交给"下一帧同 stream 的消费 kernel"，
+    //      依赖 stream 保序自动衔接——实时渲染管线（构建→查询→绘制）
+    //      的标准做法，CPU 全程不等待（异步回帧）
     cudaStreamSynchronize(stream);
 }

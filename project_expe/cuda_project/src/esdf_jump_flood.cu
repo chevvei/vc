@@ -21,6 +21,16 @@
 //   结果    ：每个体素都抄到了"真正离我最近的障碍"
 //   类比    ：谣言传播——第一轮每人只告诉远方朋友，最后一轮告诉隔壁邻居，
 //            几轮后全世界都知道最 accurate 的版本
+//
+// 💼 工程套路 ⑪：JFA 是近似算法（面试必问的坑）
+//   严格说标准 JFA 不保证精确——最坏情况少数体素会拿到"差 1~2 体素"的
+//   seed（信息跳着传，可能错过真正的最近障碍）。要精确解，教科书方案：
+//     1+JFA：jump=1 的 pass 再多跑一遍（多一个 pass，实践上消除误差）
+//     或 JFA+1：最后一个 pass 后再跑一遍 3×3 邻域精修
+//   本实现只跑到 jump=1，教学场景够用；机器人避障 ESDF 通常容忍毫米级误差。
+//   生产界的另一条路：nvblox/Voxblox 不做全量 JFA，而是增量式只更新
+//   障碍表面附近的窄带（band）——真实机器人 SLAM 里地图大多静止，
+//   全场重算就是浪费，"只更新变化的区域"是 ESDF 工程化的核心套路
 #include <cuda_runtime.h>
 #include <vector>
 
@@ -192,6 +202,19 @@ void runJumpFloodEsdf(
     //   ③ Instantiate + Launch：把图编译成可重复执行体，一次 launch 全跑
     //   收益：5 个 kernel 的 launch 只花 1 次 CPU 开销；每帧重建 ESDF 时
     //   图已编译好，直接 replay（生产代码会把 graphExec 缓存成成员变量）
+    //
+    // 💼 工程套路 ⑫：Graph 的生产形态——捕获一次，永久 replay
+    //   本函数每帧"捕获→实例化→销毁"是教学写法，实际等于没省 launch
+    //   开销还倒贴捕获成本。生产套路：
+    //     ① 首帧：捕获 + instantiate，graphExec 存为成员变量
+    //     ② 之后每帧：只调 cudaGraphLaunch(graphExec, stream)  ← 一行
+    //     ③ 参数变了（换点云/换 grid）：优先 cudaGraphExecUpdate
+    //        （改指针参数原位更新，比重新实例化便宜一个量级），
+    //        拓扑变了才重新捕获
+    //   适用判据：图的价值 = launch 数 × 提交频率。固定 5~10 个 kernel
+    //   的小图每帧跑，CPU 开销从 ~50μs 降到 ~5μs；单 kernel 的图没意义。
+    //   雷区：捕获中的 stream 不能做隐式同步（cudaMalloc 会炸捕获），
+    //   所以本函数所有分配都放在 BeginCapture 之前——这个顺序是刻意的
     cudaGraph_t graph;
     cudaGraphExec_t graphExec;
     cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
