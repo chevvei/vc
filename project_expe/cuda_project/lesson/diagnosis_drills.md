@@ -135,7 +135,57 @@
 
 ---
 
-## 阶段 6+：调度与工程化（occupancy / smem 上限 / launch 开销）
+## 阶段 6：空间索引构建（atomic + cub scan/sort）
+
+### 🎴 诊断卡 13：换了张点云，count kernel 慢十倍
+
+**症状**：均匀点云下 countCellsKernel 0.5ms。换成桌面扫描（点全聚集在 10 个 cell），同一个 kernel 涨到 5ms+。occupancy、访存指标全部正常。
+
+**先自答三问**：怀疑什么？用什么验证？怎么修？
+
+**答案**：
+- **怀疑**：atomic 热点。同地址 atomic 在 L2 原子单元排队串行——100 万次撞 10 个地址 ≈ 每地址 10 万次串行
+- **验证**：ncu Memory Workload Analysis 看 atomic 吞吐是否饱和；快速实验：把点云随机 shuffle（分布不变但逐帧冲突不变）对照——更直接的是把 cellSize 调大几倍让点散开，若耗时骤降即确认
+- **修复**：① warp 内 shuffle 预合并同 cell 请求；② smem per-cell 局部计数，block 末统一 flush（counting sort 套路，atomic 次数压一个数量级）；③ 细化 cell 分散热点
+- **项目锚点**：[uniform_grid.cu — countCellsKernel](../src/uniform_grid.cu)；深挖见 [teaching_mastery.md §4.0 故事1](../docs/teaching_mastery.md)
+
+### 🎴 诊断卡 14：每帧 build 都有毫秒级空隙
+
+**症状**：nsys timeline 上每帧 grid build 前出现 ~1ms 空隙，CPU 侧堆栈指向 `cudaMalloc`。build 本身 kernel 只需 3ms，空隙却占了 25%。
+
+**先自答三问**：
+
+**答案**：
+- **怀疑**：cub temp buffer 放在热路径每次分配/释放（两段式 pattern 的误用：size-query 本身没问题，问题是把 cudaMalloc 写进了每帧调用）；cudaMalloc 有隐式同步 + 分配器开销
+- **验证**：nsys 看 cudaMalloc 调用频率与位置；代码审计 build 函数内是否有 cudaMalloc/cudaFree
+- **修复**：temp buffer 按最大规模一次分配、成员变量缓存复用；size 变化时才重新分配
+- **项目锚点**：[uniform_grid.cu L86-97 — 当前是教学简化写法](../src/uniform_grid.cu)，工程化改造点已标注
+
+### 🎴 诊断卡 15：换真实点云后 KNN 混入远点 🎯（真实潜伏 bug）
+
+**症状**：合成数据（全在 [-100,100]³ 内）一切正常。接入真实雷达点云（含离群点）后，部分 cell 的 KNN 结果混入远处的点、且丢了自己的近点。所有 cell 都受影响，不只是 cell 0。
+
+**先自答三问**：
+
+**答案**：
+- **怀疑**：越界点 key 写 0 的潜伏 bug。countCells 只数 in-bounds 点（`cellId >= 0` 才 atomicAdd），fillCellIds 却把越界点 key 写 0 → key-0 块实际长度 = counts[0] + K（K=越界点数），而 cellStarts 基于不含 K 的 counts → **所有 cell 的查询区间整体左移 K 位**，每个 cell 混入前一块的尾巴、丢失自己的尾巴
+- **验证**：构造含 1 个越界点的小数据集（5 点手推即可复现）；或统计 sort 后各 key 块长度 vs cellCounts 是否一致
+- **修复**：越界点 key 写哨兵值 `totalCells`（比一切合法 cellId 大），排序后天然聚在数组末尾，任何合法查询区间碰不到且不干扰合法 cell 位置
+- **项目锚点**：[uniform_grid.cu — L43 与 L57 两处独立判断 `cellId >= 0`](../src/uniform_grid.cu)；完整推演见 [teaching_mastery.md §4.0 破坏-修复](../docs/teaching_mastery.md)
+- **工程教训**：同一语义在两处代码各自判断 = bug 温床；边界输入必须进测试用例
+
+### 🎴 诊断卡 16：变式 —— 垃圾桶塞进合法 cell
+
+**症状**：同事看了卡 15 的修复，改成 `cellIds[i] = (cellId >= 0) ? cellId : totalCells - 1;`——"反正最后一个 cell 也用得少，当垃圾桶"。这个修复有什么问题？
+
+**答案**：
+- **根因**：哨兵有效的本质是**哨兵值必须落在合法查询域之外**。`totalCells - 1` 是合法 cell 的 id——K 个越界点全部挤进最后一块，最后一块实际长度 = counts[last] + K，而 cellStarts 不含 K → **错位问题原样转移到最后一个 cell**（混入越界点 + 丢失自己的尾巴），只是受害者从 cell 0 换成了 cell last
+- **正确写法**：哨兵 = `totalCells`（或任何 ≥ totalCells 的值），让异常元素聚在"无人查询"的区间
+- **考察点**：背答案的人只会改 `totalCells`；理解的人知道为什么必须是查询域外的值——这是 L2 与 L3 的分水岭
+
+---
+
+## 阶段 7+：调度与工程化（occupancy / smem 上限 / launch 开销）
 
 ### 🎴 诊断卡 10：kernel 直接启动失败
 
@@ -189,6 +239,9 @@
 | 部分结果错 | 归约层级缺失 | 7 |
 | 偶发错误 | race / 缺 syncthreads | 8 |
 | smem 利用率低 | bank conflict | 9 |
+| 换数据后计数变慢 | atomic 热点（同地址串行） | 13 |
+| 每帧 build 有空隙 | temp buffer 每帧 cudaMalloc | 14 |
+| 混入远点/丢近点 | 越界点 key 污染（哨兵缺失） | 15、16 |
 | launch 失败 | smem 超限 | 10 |
 | 利用率锯齿 | launch 开销 / 串行 | 11 |
 | （从零写不出） | 白纸复现缺失 | 12 |

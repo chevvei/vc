@@ -960,6 +960,180 @@ for (int offset = 16; offset > 0; offset >>= 1) {
 
 ## 第 4 章：空间索引构建
 
+### 4.0 三故事深挖：从故事 → 硬件 → 代码 → 工程
+
+> 阶段 6 对应深挖。三个故事其实是一条流水线：**计数（atomic）→ 定位（scan）→ 排队（sort）**。
+> 这是 GPU 上一切"空间哈希 / grid / counting sort"的标准三步范式，也是粒子模拟、BVH 构建的通用套路。
+
+#### 📕 故事 1 深挖：atomicAdd —— 取号机为什么安全
+
+**先问一个问题**：`counter++` 明明是一行代码，为什么不安全？
+
+**硬件根因**：一行 C++ 在 GPU 上编译成三条 SASS 指令：
+
+```
+LDG   R1, [counter]     ← load
+IADD  R1, R1, 1         ← add
+STG   [counter], R1     ← store
+```
+
+两个线程同时执行：A 读到 5、B 读到 5、A 写 6、B 写 6 → **丢一次更新**。总计数值随机小于等于真实值，且不可复现。
+
+**GPU 的残酷现实**：跨 block 没有互斥锁、没有全局同步（kernel 边界是唯一全局屏障）。`atomicAdd` 是硬件提供的**唯一安全并发写**：在 **L2 cache 原子单元**执行，同地址请求在硬件队列里**排队串行**，不同地址完全并行。
+
+**验证丢更新存在**（30 秒实验）：把 `atomicAdd(&c, 1)` 改成 `c = c + 1`，跑完把 cellCounts 求和，结果 < n。
+
+**代码映射**：[uniform_grid.cu](../src/uniform_grid.cu) `countCellsKernel`：
+
+```cpp
+if (cellId >= 0) atomicAdd(&cellCounts[cellId], 1);   // L43
+```
+
+**工程取舍（面试考点）**——atomic 的代价模型 = 同地址串行：
+
+| 场景 | 冲突程度 | 对策 |
+|------|----------|------|
+| 点云均匀（本项目，100 万点散在百万格） | 极少 | 直接 atomic，够了 |
+| 点云聚集（如桌面扫描堆在几个格） | 100 万次撞同一地址 | 必须优化 |
+| 极端热点 | 退化串行 | 换数据结构 |
+
+优化路径（由轻到重）：
+1. **warp 内预合并**：warp 里多个线程撞同一 cell 时，先用 shuffle/reduce 合并成一次请求，再发一次 atomic
+2. **smem 局部计数**：block 内各 cell 先在 shared memory 计数，block 结束统一 flush 到 global——把上千次 atomic 压成几十次（counting sort 的标准套路）
+3. **细化 cell**：格子更小 → 点更散 → 冲突自然少（代价：cell 数量平方增长，scan/sort 变贵）
+
+**面试讲法**：
+> "grid 计数用 atomicAdd，它是 GPU 上唯一安全的并发写，硬件在 L2 原子单元把同地址请求串行化。代价是热点 cell 会退化串行，标准优化是先在 smem/warp 内做局部归约，再合并成少量 global atomic，能把 atomic 次数压一个数量级。我们项目点云均匀，实测直接 atomic 就够，但我能讲清楚聚集场景的优化路径。"
+
+**❓ 自检**：
+- `++` 为什么不安全？→ 三条指令 LDG/IADD/STG，读和写之间会被插入别人的读
+- atomic 在硬件哪里执行？→ L2 原子单元，同地址排队串行，不同地址并行
+- 什么时候必须优化 atomic？→ 冲突地址数 × 请求频率高（点聚集、hash 桶少）
+
+#### 📕 故事 2 深挖：Exclusive Scan —— 串行依赖是 GPU 天敌
+
+**为什么不能写 `for` 循环**：`starts[i] = starts[i-1] + counts[i-1]` 是 **O(N) 依赖链**，每步等上一步。GPU 有一万个线程也只能干瞪眼——**串行依赖和 bank conflict 并列 GPU 两大天敌**。
+
+**并行 scan 思想**（Blelloch）：log₂(N) 轮，每轮 N/2 线程同时工作：
+- **up-sweep**（向上收集）：相邻配对求和，像倒着的金字塔
+- **down-sweep**（向下分发）：把前缀和分发回每个位置
+- 总深度 O(log N)，work-efficient 版总工作量 O(N)
+
+**知道思想即可，禁止手写**——边界、temp buffer 管理、跨 block 通信全是坑，NVIDIA 帮你写好了。
+
+**代码映射——cub 两段式调用 pattern**（[uniform_grid.cu](../src/uniform_grid.cu) L86-93）：
+
+```cpp
+size_t tempBytes = 0;
+// 第 1 次：传 nullptr，只问"需要多少临时空间"
+cub::DeviceScan::ExclusiveSum(nullptr, tempBytes, cellCounts, cellStarts, n, stream);
+cudaMalloc(&tempBuf, tempBytes);
+// 第 2 次：真跑
+cub::DeviceScan::ExclusiveSum(tempBuf, tempBytes, cellCounts, cellStarts, n, stream);
+```
+
+**这是所有 `cub::Device*` API 的通用套路**（size-query then run）。为什么这么设计：不同输入规模/数据分布需要的 temp 不同，库不替你管内存，让你自己分配复用。
+
+**exclusive vs inclusive**（易错）：
+- exclusive：`out[i] = sum(in[0..i-1])`，不含自己 → **cellStart 要这个**（起始位置 = 前面所有人总数）
+- inclusive：`out[i] = sum(in[0..i])`，含自己 → 用它做 start 会差一位
+
+**工程取舍**：本项目每次 build 都 `cudaMalloc(tempBytes)` 再 free——**教学简化**。工程正确做法：temp buffer 按最大规模**一次分配、缓存复用**。`cudaMalloc` 有隐式同步 + 分配开销，高频调用是性能大忌（尤其放在每帧调用的 build 里）。
+
+**面试讲法**：
+> "cell 起始位置用 cub 的 exclusive scan。串行 scan 是 O(N) 依赖链，GPU 上必死；cub 的 Blelloch work-efficient scan 是 O(log N) 深度 O(N) 工作量。cub 的 API 是两段式：第一次传 nullptr 查 temp 大小，第二次真跑。temp buffer 工程上要缓存复用，别每帧 malloc。"
+
+**❓ 自检**：
+- 串行 scan 为什么 GPU 上慢？→ O(N) 依赖链，每步等上一步，并行度 1
+- cub 为什么调用两次？→ 第一次 size-query 算 temp 大小，第二次执行——所有 Device* API 通用
+- cellStart 用 exclusive 还是 inclusive？→ exclusive，start = 前面的总数不含自己
+
+#### 📕 故事 3 深挖：Radix Sort —— GPU 为什么抛弃比较排序
+
+**比较排序（快排/归并）在 GPU 上的三宗罪**：
+1. O(N log N) 次比较，比较次数比 radix 的线性扫描多
+2. 分支发散：比较结果不一致 → warp 内走岔路（对照阶段 5 的 if 危害）
+3. 不规则访存：partition 交换地址乱跳，cache line 全废
+
+**Radix 的反击**：32-bit int key = **4 pass × 8-bit 分桶**。每个 pass 内部就是"计数 + scan + scatter"——**全是刚学过的原语**，访存规则、零分支。GPU 天然亲 radix。
+
+**key-value pair 是精髓**（[uniform_grid.cu](../src/uniform_grid.cu) L107-127）：
+
+```cpp
+// values 初始化为 0..n-1（点的原始索引）
+thrust::sequence(thrust::cuda::par.on(stream), idxIn, idxIn + cloud.n);
+// 按 keys=cellIds 排序，values（索引）跟着搬家
+cub::DeviceRadixSort::SortPairs(temp, tempBytes,
+    cellIds, sortedCellIds,   // keys in → out
+    idxIn, grid.sortedIndices, // values in → out
+    n, 0, sizeof(int)*8, stream);
+```
+
+排完后 `sortedIndices` 中同 cell 的点**连续存放**。查询端：
+
+```cpp
+// 查 cell c 的所有点：sortedIndices[cellStarts[c] .. cellStarts[c]+cellCounts[c])
+// 连续区间 → 阶段 4 的合并访存在这里闭环
+```
+
+**为什么这条链自洽**：count（atomic）→ scan（cub）→ sort（radix 内部又是 count+scan+scatter）——**空间索引构建 = 并行原语的接力**。这就是面试官想听的"体系化理解"。
+
+**工程取舍**：
+- `thrust::sort_by_key` 一行也能排（int key 内部也走 radix），为什么直接用 cub：省一层迭代器抽象、temp/stream 全可控；thrust 本身就是 cub 的封装
+- `begin_bit=0, end_bit=32`：只按 32 位全位排序；若 key 范围小（如 cellId < 65536）可只排 16 位，**快一倍**——免费优化
+- SortPairs **不支持 input==output 别名**（代码注释里标了）——in-place 需求要用双缓冲换着排
+
+**面试讲法**：
+> "按 cellId 排序用 cub radix sort。GPU 不用比较排序：O(N log N) 比较 + 分支发散 + 不规则访存三宗罪；radix 4 pass 8-bit 分桶，每 pass 就是 count+scan+scatter，全是规则访存。key-value pair 排完后同 cell 点连续，查询端切连续区间，合并访存闭环。key 范围小的时候可以截断位数白拿一倍加速。"
+
+**❓ 自检**：
+- GPU 为什么不用快排？→ 比较发散 + 不规则访存 + O(N log N) 比较
+- 32-bit key 排几次？→ 4 次（每 pass 处理 8 bit）
+- sort 之后哪里闭环了前面的优化？→ 同 cell 连续 → 查询合并访存（阶段 4 的布局思想在索引结构上重现）
+
+#### 🎯 破坏-修复：本仓库埋着的真 bug（L43 vs L57）
+
+```cpp
+// countCellsKernel：越界点【不计数】
+if (cellId >= 0) atomicAdd(&cellCounts[cellId], 1);
+
+// fillCellIdsKernel：越界点 key【写 0】
+cellIds[i] = (cellId >= 0) ? cellId : 0;
+```
+
+**爆雷条件**：点云中出现 grid 范围外的点（越界点数记 K > 0）。
+
+**灾难机制**（推演一个 5 点小例子）：
+
+```
+counts（只数 in-bounds）= [1, 1, 1] → cellStarts = [0, 1, 2]
+keys = [2, 1, 0, 0, 0]   ← p3、p4 是越界点，被写成 key 0
+排序后 keys = [0, 0, 0, 1, 2]   ← key-0 块有 3 个点，比 counts[0] 多 2！
+
+查询 cell 0: [0, 1) → 对（运气好）
+查询 cell 1: [1, 2) → 拿到 key-0 块的尾巴（越界点！）自己的点漏了
+查询 cell 2: [2, 3) → 同上，混入陌生点、丢失自己的点
+```
+
+**根因**：key-0 块实际长度 = counts[0] + K，但所有 cellStarts 都基于不含 K 的 counts → **每个 cell 的查询区间整体左移 K 位**——不只 cell 0，全部错位。
+
+**为什么测试没炸**：本项目生成数据全在 [-100,100]³ 内，K 恒为 0 → **潜伏 bug**，换一张有离群点的真实点云立刻爆。这是"两处独立判断同一条件"的经典 bug 温床。
+
+**修复**（一行）：
+
+```cpp
+cellIds[i] = (cellId >= 0) ? cellId : totalCells;  // 哨兵 key，排序后天然聚在数组末尾
+```
+
+越界点 key 设为 totalCells（比一切合法 cellId 大）→ 排序后聚在末尾，任何合法查询区间都碰不到，且**不干扰**合法 cell 的相对位置。
+
+**工程教训**：
+1. "同一个语义在两处代码各自判断"= bug 温床（这里两处各自处理 `cellId >= 0`）
+2. 边界条件（越界输入）必须进测试用例——正常数据测一万次也抓不到这个 bug
+3. 哨兵值（sentinel）是处理"异常元素参与排序"的标准手法
+
+---
+
 ### 4.1 Atomic 并发计数
 
 #### 🏠 生活类比：多人计数
