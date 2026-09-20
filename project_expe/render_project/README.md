@@ -12,8 +12,8 @@
 | 3 | [02_ray_tracing](docs/02_ray_tracing.md) | 光线追踪 | 从像素反着"问"世界，真实但贵 |
 | 4 | [03_opengl](docs/03_opengl.md) | OpenGL | 30 年图形 API 老将：状态机哲学 |
 | 5 | [04_vulkan](docs/04_vulkan.md) | Vulkan | 显式控制哲学：1500 行画一个三角形 |
-| 6 | [05_vtk](docs/05_vtk.md) | VTK | 科学可视化框架：和游戏引擎不是一回事 |
-| 7 | [06_shader](docs/06_shader.md) | Shader 编程 | 给 GPU 写的小程序；GPU 本为它而生 |
+| 5 | [05_vtk](docs/05_vtk.md) | VTK | 科学可视化框架；含"VTK 与 Shader 谁写谁编译" |
+| 6 | [06_shader](docs/06_shader.md) | Shader 编程 | GPU 小程序；OpenGL 宿主关系 + GLSL vs SPIR-V |
 | 8 | [07_3dgs](docs/07_3dgs.md) | 球谐函数 + 3DGS | 高斯雪球叠加：新渲染范式，NeRF 的实用化 |
 | 9 | [08_decision_map](docs/08_decision_map.md) | 决策地图 | 场景 → 技术选择速查表 + 面试话术 |
 
