@@ -120,7 +120,7 @@ const proj = (x, z) => CX + x * F / (CAM.z - z);
 const realScale  = F / (CAM.z - OBJ_Z);      // ≈68.6
 const mirScale   = F / (CAM.z - MIR_Z);      // ≈28.2
 
-const top = document.getElementById('topView').getContext('2d');
+const tg = document.getElementById('topView').getContext('2d');
 const scr = document.getElementById('screenView').getContext('2d');
 
 // 楔形（视线穿过镜框延伸到墙后）在 z 平面处的半宽
@@ -178,7 +178,7 @@ function drawPersonScreen(g, sx, baseY, h, color, alpha) {
 
 // ============ 俯视图 ============
 function drawTop() {
-    const g = top;
+    const g = tg;
     g.clearRect(0, 0, TW, TH);
     g.fillStyle = '#141a22'; g.fillRect(0, 0, TW, TH);
 
