@@ -77,6 +77,7 @@
     <button class="mode" data-mode="2">③ Pass 2 限行</button>
     <button class="mode" data-mode="3">④ 最终效果</button>
     <label class="chk"><input type="checkbox" id="chkSight" checked>视线</label>
+    <label class="chk"><input type="checkbox" id="chkEqui" checked>等价视线</label>
     <label class="chk"><input type="checkbox" id="chkMove">物体自动移动</label>
     <div class="slider-box">小明位置 <input type="range" id="oxSlider" min="0.2" max="3.2" step="0.01" value="2.6"> <span id="oxVal">2.6</span></div>
 </div>
@@ -103,6 +104,7 @@ let state = {
     mode: 0,          // 0穿帮 1圈地 2限行 3最终
     ox: 2.6,          // 小明 x 位置
     showSight: true,
+    showEqui: true,
     autoMove: false,
     t: 0,
 };
@@ -229,6 +231,42 @@ function drawTop() {
         g.strokeRect(bx0, tz(MIR_Z) - 13, bx1 - bx0, 26);
         g.fillStyle = '#ff7b7b'; g.font = 'bold 11px sans-serif'; g.textAlign = 'center';
         g.fillText('穿帮段', (bx0 + bx1)/2, tz(MIR_Z) + 42);
+    }
+
+    // 等价视线证明：直穿看镜像副本 = 反弹看真身（同一屏幕像素）
+    if (state.showEqui) {
+        const mEdge = state.ox - OBJ_HW;                 // 副本靠镜一侧的边缘 x
+        const tCross = CAM.z / (CAM.z - MIR_Z);          // CAM→副本连线与 z=0 的交点参数
+        const qx = mEdge * tCross;                       // 交点 x（CAM.x=0）
+        const qx0 = tx(qx), qy0 = tz(0);
+        if (Math.abs(qx) <= MIRROR_HW) {
+            // 路线B：相机 → 穿过 Q → 直达镜像副本（实线，青）
+            g.strokeStyle = 'rgba(87,184,174,0.95)'; g.lineWidth = 2.2;
+            g.beginPath();
+            g.moveTo(tx(CAM.x), tz(CAM.z)); g.lineTo(qx0, qy0);
+            g.lineTo(tx(mEdge), tz(MIR_Z)); g.stroke();
+            // 路线A：相机 → Q → 反弹到真身（虚线，橙）
+            g.strokeStyle = 'rgba(232,150,75,0.95)'; g.setLineDash([6,4]); g.lineWidth = 2.2;
+            g.beginPath();
+            g.moveTo(qx0, qy0); g.lineTo(tx(mEdge), tz(OBJ_Z)); g.stroke();
+            g.setLineDash([]);
+            // Q 点标记
+            g.fillStyle = '#e8b34b';
+            g.beginPath(); g.arc(qx0, qy0, 4, 0, Math.PI*2); g.fill();
+            g.fillStyle = '#ffd98a'; g.font = 'bold 11px sans-serif'; g.textAlign = 'center';
+            g.fillText('Q', qx0, qy0 - 10);
+            const midX = (qx0 + tx(mEdge)) / 2;
+            g.font = '11px sans-serif'; g.textAlign = 'center';
+            g.fillStyle = '#7ec8c2';
+            g.fillText('直穿→看镜像副本', midX, (qy0 + tz(MIR_Z))/2 + 18);
+            g.fillStyle = '#e8964b';
+            g.fillText('反弹→看真身', midX, (qy0 + tz(OBJ_Z))/2 - 12);
+            g.fillStyle = '#6ee38a'; g.font = 'bold 11px sans-serif'; g.textAlign = 'left';
+            g.fillText('两条路线同一屏幕像素 → 副本就是倒影本身', 12, 46);
+        } else {
+            g.fillStyle = '#8892a6'; g.font = '11px sans-serif'; g.textAlign = 'left';
+            g.fillText('该视线不经过镜面 → 副本这部分不该出现在镜中（画了就是穿帮）', 12, 46);
+        }
     }
 
     // 真实小明
@@ -388,6 +426,7 @@ document.getElementById('oxSlider').addEventListener('input', e => {
     state.ox = +e.target.value; document.getElementById('oxVal').textContent = state.ox.toFixed(1);
 });
 document.getElementById('chkSight').addEventListener('change', e => state.showSight = e.target.checked);
+document.getElementById('chkEqui').addEventListener('change', e => state.showEqui = e.target.checked);
 document.getElementById('chkMove').addEventListener('change', e => {
     state.autoMove = e.target.checked;
     if (state.autoMove) state.moveBase = state.ox;
