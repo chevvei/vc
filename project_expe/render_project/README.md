@@ -18,6 +18,14 @@
 | 9 | [08_decision_map](docs/08_decision_map.md) | 决策地图 | 场景 → 技术选择速查表 + 面试话术 |
 | 随查 | [09_glossary_pipeline](docs/09_glossary_pipeline.md) | 概念白话词典 | 全部名词按流水线串讲（片元/顶点/图元/Z-Buffer/求交…），建议 00 后先读 |
 
+## 交互演示（demos/）
+
+浏览器直接打开，配合文档食用：
+
+| 演示 | 配套文档 | 演示什么 |
+|---|---|---|
+| [mirror_stencil.html](demos/mirror_stencil.html) | 09 概念词典·模板缓冲 | 双视图联动：俯视图看 3D 真相、屏幕视图看渲染结果；四模式（穿帮→圈地→限行→最终），拖动物体实时看"镜像伸出镜框"的穿帮与模板修复 |
+
 ## 知识依赖图
 
 ```

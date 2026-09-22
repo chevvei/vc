@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>镜子倒影 × 模板缓冲 — 交互演示</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        background: #0f141a; color: #d8dee9;
+        font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+        padding: 24px; max-width: 1240px; margin: 0 auto;
+    }
+    h1 { font-size: 22px; color: #e6e9ef; margin-bottom: 4px; }
+    .subtitle { color: #8892a6; font-size: 13px; margin-bottom: 18px; }
+    .subtitle b { color: #e8b34b; }
+    .views { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
+    .panel {
+        background: #1a212b; border: 1px solid #2a3547; border-radius: 10px;
+        padding: 12px; flex: 1; min-width: 420px;
+    }
+    .panel h2 { font-size: 14px; color: #9fb3d1; margin-bottom: 8px; font-weight: 600; }
+    .panel h2 span { color: #5b6a82; font-weight: 400; font-size: 12px; }
+    canvas { display: block; width: 100%; height: auto; border-radius: 6px; background: #141a22; }
+    .controls {
+        background: #1a212b; border: 1px solid #2a3547; border-radius: 10px;
+        padding: 14px; margin-bottom: 14px;
+        display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    }
+    button {
+        background: #26303f; color: #c9d4e3; border: 1px solid #38465c;
+        border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+        transition: all .15s;
+    }
+    button:hover { background: #324054; }
+    button.active { background: #e8b34b; color: #1a1206; border-color: #e8b34b; font-weight: 600; }
+    button.play { background: #2d6a4f; border-color: #40916c; color: #d8f3dc; }
+    button.play.on { background: #40916c; color: #fff; }
+    .slider-box { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #9fb3d1; margin-left: auto; }
+    input[type=range] { width: 140px; accent-color: #e8b34b; }
+    label.chk { font-size: 12px; color: #9fb3d1; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+    .explain {
+        background: #1a212b; border: 1px solid #2a3547; border-radius: 10px;
+        padding: 14px 18px; font-size: 14px; line-height: 1.75; min-height: 92px;
+    }
+    .explain .tag {
+        display: inline-block; font-size: 12px; padding: 2px 10px; border-radius: 10px;
+        margin-bottom: 6px; font-weight: 600;
+    }
+    .explain p b { color: #e8b34b; }
+    .explain p i { color: #7ec8c2; font-style: normal; }
+    .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: #8892a6; margin-top: 10px; }
+    .legend span { display: flex; align-items: center; gap: 5px; }
+    .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+</style>
+</head>
+<body>
+
+<h1>镜子倒影 × 模板缓冲（Stencil Buffer）</h1>
+<div class="subtitle">核心问题：<b>CG 的倒影为什么会"伸出"镜框？</b>模板缓冲如何用"先圈地、后限行"修复它</div>
+
+<div class="views">
+    <div class="panel">
+        <h2>俯视图（从天花板往下看） <span>— 3D 空间的真相</span></h2>
+        <canvas id="topView" width="640" height="400"></canvas>
+    </div>
+    <div class="panel">
+        <h2>屏幕视图（相机拍到的画面） <span>— 渲染结果</span></h2>
+        <canvas id="screenView" width="480" height="400"></canvas>
+    </div>
+</div>
+
+<div class="controls">
+    <button class="play" id="btnPlay">▶ 自动讲解</button>
+    <button class="mode active" data-mode="0">① 无模板（穿帮）</button>
+    <button class="mode" data-mode="1">② Pass 1 圈地</button>
+    <button class="mode" data-mode="2">③ Pass 2 限行</button>
+    <button class="mode" data-mode="3">④ 最终效果</button>
+    <label class="chk"><input type="checkbox" id="chkSight" checked>视线</label>
+    <label class="chk"><input type="checkbox" id="chkMove">物体自动移动</label>
+    <div class="slider-box">小明位置 <input type="range" id="oxSlider" min="0.2" max="3.2" step="0.01" value="2.6"> <span id="oxVal">2.6</span></div>
+</div>
+
+<div class="explain" id="explain"></div>
+
+<div class="legend">
+    <span><span class="dot" style="background:#e8964b"></span>真实小明（墙前 z=+2.5）</span>
+    <span><span class="dot" style="background:#57b8ae"></span>镜像副本（墙后 z=−2.5，沿镜面翻折）</span>
+    <span><span class="dot" style="background:#c0c8d4"></span>镜子（只是贴银色贴图的平面）</span>
+    <span><span class="dot" style="background:#3d9c5055"></span>穿过镜面的视线区（物理可见区）</span>
+    <span><span class="dot" style="background:#d44545"></span>穿帮段（真实世界那里只有墙）</span>
+</div>
+
+<script>
+// ============ 世界参数 ============
+const CAM = { x: 0, z: 6 };        // 相机
+const MIRROR_HW = 1.2;             // 镜子半宽（墙上 x ∈ [-1.2, 1.2]）
+const OBJ_Z = 2.5, MIR_Z = -2.5;   // 小明 / 镜像副本的 z
+const OBJ_HW = 0.5;                // 小明半宽（世界单位）
+const F = 240;                     // 屏幕投影焦距（像素）
+
+let state = {
+    mode: 0,          // 0穿帮 1圈地 2限行 3最终
+    ox: 2.6,          // 小明 x 位置
+    showSight: true,
+    autoMove: false,
+    t: 0,
+};
+
+// ============ 俯视图几何映射 ============
+const TW = 640, TH = 400;
+const SXX = 68, SZZ = 31;                    // x/z 比例（px/世界单位）
+const tx = x => TW/2 + x*SXX;
+const tz = z => TH - 26 - (z + 4)*SZZ;       // z=-4 → 底部, z=6 → 顶部附近
+
+// ============ 屏幕视图几何 ============
+const SW = 480, SH = 400, CX = SW/2;
+const FRAME = { hw: MIRROR_HW * F / (CAM.z - 0), h: 168, cy: 158 }; // 镜框投影
+const proj = (x, z) => CX + x * F / (CAM.z - z);
+const realScale  = F / (CAM.z - OBJ_Z);      // ≈68.6
+const mirScale   = F / (CAM.z - MIR_Z);      // ≈28.2
+
+const top = document.getElementById('topView').getContext('2d');
+const scr = document.getElementById('screenView').getContext('2d');
+
+// 楔形（视线穿过镜框延伸到墙后）在 z 平面处的半宽
+const wedgeHW = z => MIRROR_HW * (CAM.z - z) / CAM.z;
+
+// ============ 斜纹 pattern ============
+function makeHatch(color, bg) {
+    const c = document.createElement('canvas'); c.width = c.height = 10;
+    const g = c.getContext('2d');
+    if (bg) { g.fillStyle = bg; g.fillRect(0,0,10,10); }
+    g.strokeStyle = color; g.lineWidth = 1.6;
+    g.beginPath(); g.moveTo(-2,12); g.lineTo(12,-2); g.moveTo(-2,2); g.lineTo(2,-2);
+    g.moveTo(6,12); g.lineTo(12,6); g.stroke();
+    return scr.createPattern(c, 'repeat');
+}
+let hatchRed, hatchGreen, hatchGreenBg, hatchRedBg;
+
+// ============ 小人（俯视） ============
+function drawPersonTop(g, wx, wz, color, alpha, label) {
+    const px = tx(wx), py = tz(wz);
+    g.save(); g.globalAlpha = alpha;
+    g.fillStyle = color;
+    g.beginPath(); g.ellipse(px, py, 19, 11, 0, 0, Math.PI*2); g.fill();  // 肩
+    g.fillStyle = '#f5e6d0';
+    g.beginPath(); g.arc(px, py, 8, 0, Math.PI*2); g.fill();              // 头
+    g.fillStyle = color;
+    g.beginPath(); g.arc(px, py, 8, 0, Math.PI*2); g.stroke && g.stroke();
+    if (label) {
+        g.globalAlpha = Math.min(1, alpha + .25);
+        g.font = '11px sans-serif'; g.textAlign = 'center';
+        g.fillStyle = color;
+        g.fillText(label, px, py + 26);
+    }
+    g.restore();
+}
+
+// ============ 小人（屏幕正视） ============
+function drawPersonScreen(g, sx, baseY, h, color, alpha) {
+    const headR = h * 0.16, bodyW = h * 0.44;
+    g.save(); g.globalAlpha = alpha;
+    g.fillStyle = color;
+    // 身体（圆角梯形）
+    g.beginPath();
+    g.moveTo(sx - bodyW/2, baseY);
+    g.quadraticCurveTo(sx - bodyW/2 - 2, baseY - h*0.52, sx - bodyW*0.3, baseY - h*0.62);
+    g.lineTo(sx + bodyW*0.3, baseY - h*0.62);
+    g.quadraticCurveTo(sx + bodyW/2 + 2, baseY - h*0.52, sx + bodyW/2, baseY);
+    g.closePath(); g.fill();
+    // 头
+    g.fillStyle = '#f2d9b8';
+    g.beginPath(); g.arc(sx, baseY - h*0.62 - headR - 2, headR, 0, Math.PI*2); g.fill();
+    g.strokeStyle = color; g.lineWidth = 1.5; g.stroke();
+    g.restore();
+}
+
+// ============ 俯视图 ============
+function drawTop() {
+    const g = top;
+    g.clearRect(0, 0, TW, TH);
+    g.fillStyle = '#141a22'; g.fillRect(0, 0, TW, TH);
+
+    const wallY = tz(0);
+
+    // 视线楔形：相机过镜框边缘延伸到墙后（物理可见区）
+    if (state.showSight) {
+        const farL = tx(-wedgeHW(-4.2)), farR = tx(wedgeHW(-4.2));
+        g.fillStyle = 'rgba(61,156,80,0.10)';
+        g.beginPath();
+        g.moveTo(tx(CAM.x), tz(CAM.z));
+        g.lineTo(farR, tz(-4.2)); g.lineTo(farL, tz(-4.2));
+        g.closePath(); g.fill();
+        g.strokeStyle = 'rgba(80,200,110,0.35)'; g.setLineDash([5,5]); g.lineWidth = 1.2;
+        g.beginPath();
+        g.moveTo(tx(CAM.x), tz(CAM.z)); g.lineTo(farR, tz(-4.2));
+        g.moveTo(tx(CAM.x), tz(CAM.z)); g.lineTo(farL, tz(-4.2));
+        g.stroke(); g.setLineDash([]);
+    }
+
+    // 墙
+    g.fillStyle = '#3a4351';
+    g.fillRect(0, wallY - 9, TW, 18);
+    g.strokeStyle = '#4d5a6e'; g.lineWidth = 1;
+    g.strokeRect(0.5, wallY - 9.5, TW - 1, 19);
+
+    // 镜子（墙上一段）
+    const mx0 = tx(-MIRROR_HW), mx1 = tx(MIRROR_HW);
+    const grad = g.createLinearGradient(0, wallY - 9, 0, wallY + 9);
+    grad.addColorStop(0, '#e8edf4'); grad.addColorStop(.5, '#aab6c8'); grad.addColorStop(1, '#dfe6ef');
+    g.fillStyle = grad; g.fillRect(mx0, wallY - 9, mx1 - mx0, 18);
+    g.strokeStyle = '#8fa0b8'; g.strokeRect(mx0, wallY - 9, mx1 - mx0, 18);
+    g.font = '11px sans-serif'; g.textAlign = 'center'; g.fillStyle = '#9fb3d1';
+    g.fillText('镜子（贴图平面，不会弹光）', TW/2, wallY + 30);
+    g.fillStyle = '#5b6a82';
+    g.fillText('墙 z=0', 36, wallY - 16);
+
+    // 镜像副本（墙后）+ 穿帮段标注
+    const visHW = wedgeHW(MIR_Z);   // z=-2.5 处可见半宽 ≈1.7
+    const mL = state.ox - OBJ_HW, mR = state.ox + OBJ_HW;
+    drawPersonTop(g, state.ox, MIR_Z, '#57b8ae', 0.55, '镜像副本');
+    // 穿帮段：镜像超出楔形可见区的部分
+    if (mR > visHW) {
+        g.fillStyle = 'rgba(212,69,69,0.75)';
+        const bx0 = tx(Math.max(mL, visHW)), bx1 = tx(mR);
+        g.fillRect(bx0, tz(MIR_Z) - 13, bx1 - bx0, 26);
+        g.strokeStyle = '#d44545'; g.lineWidth = 1.5;
+        g.strokeRect(bx0, tz(MIR_Z) - 13, bx1 - bx0, 26);
+        g.fillStyle = '#ff7b7b'; g.font = 'bold 11px sans-serif'; g.textAlign = 'center';
+        g.fillText('穿帮段', (bx0 + bx1)/2, tz(MIR_Z) + 42);
+    }
+
+    // 真实小明
+    drawPersonTop(g, state.ox, OBJ_Z, '#e8964b', 1, '真实小明');
+
+    // 相机
+    const px = tx(CAM.x), py = tz(CAM.z);
+    g.fillStyle = '#c9a7e8';
+    g.beginPath(); g.arc(px, py, 10, 0, Math.PI*2); g.fill();
+    g.fillStyle = '#141a22';
+    g.beginPath(); g.arc(px, py, 4.5, 0, Math.PI*2); g.fill();
+    g.fillStyle = '#c9a7e8'; g.font = '11px sans-serif'; g.textAlign = 'center';
+    g.fillText('相机', px, py - 18);
+
+    // 相机 → 镜框边缘视线
+    if (state.showSight) {
+        g.strokeStyle = 'rgba(201,167,232,0.5)'; g.setLineDash([4,4]); g.lineWidth = 1.2;
+        g.beginPath();
+        g.moveTo(px, py); g.lineTo(tx(-MIRROR_HW), wallY);
+        g.moveTo(px, py); g.lineTo(tx(MIRROR_HW), wallY);
+        g.stroke(); g.setLineDash([]);
+    }
+
+    // z 轴标注
+    g.fillStyle = '#5b6a82'; g.font = '10px sans-serif'; g.textAlign = 'left';
+    g.fillText('墙后世界 z<0', 12, 24);
+    g.fillText('相机前方 z>0', 12, TH - 12);
+}
+
+// ============ 屏幕视图 ============
+function drawScreen() {
+    const g = scr;
+    g.clearRect(0, 0, SW, SH);
+
+    const fL = CX - FRAME.hw, fR = CX + FRAME.hw;
+    const fT = FRAME.cy - FRAME.h/2, fB = FRAME.cy + FRAME.h/2;
+
+    // ---- 背景：墙 + 地板 ----
+    const wall = g.createLinearGradient(0, 0, 0, SH);
+    wall.addColorStop(0, '#a8b0bc'); wall.addColorStop(1, '#8d95a3');
+    g.fillStyle = wall; g.fillRect(0, 0, SW, SH);
+    g.strokeStyle = 'rgba(60,70,85,0.18)'; g.lineWidth = 1;
+    for (let y = 30; y < SH; y += 46) { g.beginPath(); g.moveTo(0, y); g.lineTo(SW, y); g.stroke(); }
+    // 地板
+    g.fillStyle = '#6b7382'; g.fillRect(0, 322, SW, SH - 322);
+    g.strokeStyle = 'rgba(40,48,60,0.35)';
+    for (let i = 1; i <= 4; i++) { const y = 322 + i*i*5; g.beginPath(); g.moveTo(0, y); g.lineTo(SW, y); g.stroke(); }
+
+    const m = state.mode;
+
+    // ---- Pass 1：圈地（模板标记可视化） ----
+    if (m === 1 || m === 2) {
+        // 框内 stencil=1 绿纹，框外 stencil=0 红纹
+        g.fillStyle = hatchGreenBg; g.fillRect(fL, fT, fR - fL, fB - fT);
+        g.fillStyle = hatchRedBg;  g.fillRect(0, 0, SW, SH);
+        g.save();
+        g.beginPath(); g.rect(fL, fT, fR - fL, fB - fT); g.clip();
+        g.fillStyle = hatchGreenBg; g.fillRect(0, 0, SW, SH);
+        g.restore();
+        g.font = 'bold 12px sans-serif'; g.textAlign = 'center';
+        g.fillStyle = '#3d9c50'; g.fillText('stencil = 1（允许写色）', CX, fT - 10);
+        g.fillStyle = '#d44545'; g.textAlign = 'left'; g.fillText('stencil = 0（禁止）', 10, 24);
+    }
+
+    // ---- 镜面 ----
+    const mg = g.createLinearGradient(fL, fT, fR, fB);
+    if (m === 3) { mg.addColorStop(0, '#dfe6f0'); mg.addColorStop(.45, '#b8c4d6'); mg.addColorStop(.6, '#eef3fa'); mg.addColorStop(1, '#a6b3c7'); }
+    else { mg.addColorStop(0, '#c8d0dc'); mg.addColorStop(1, '#a8b3c4'); }
+    g.fillStyle = mg; g.fillRect(fL, fT, fR - fL, fB - fT);
+    g.strokeStyle = '#5b6a82'; g.lineWidth = 3; g.strokeRect(fL, fT, fR - fL, fB - fT);
+    if (m === 3) {  // 镜面高光
+        g.save(); g.beginPath(); g.rect(fL, fT, fR - fL, fB - fT); g.clip();
+        g.fillStyle = 'rgba(255,255,255,0.28)';
+        g.beginPath(); g.moveTo(fL, fB - 30); g.lineTo(fL + 34, fT); g.lineTo(fL + 66, fT); g.lineTo(fL + 12, fB); g.closePath(); g.fill();
+        g.restore();
+    }
+
+    // ---- 镜像副本投影 ----
+    const mSX = proj(state.ox, MIR_Z), mH = 1.8 * mirScale, mW = 1.1 * mirScale;
+    const mBaseY = fB - 8;
+
+    if (m === 0) {
+        // 无模板：完整画 → 穿帮
+        drawPersonScreen(g, mSX, mBaseY, mH, '#57b8ae', 0.62);
+        // 穿帮高亮：镜像 bbox 与镜框外区域交集
+        g.save();
+        g.beginPath();
+        g.rect(0, 0, SW, SH); g.rect(fL, fT, fR - fL, fB - fT);
+        g.clip('evenodd');
+        g.fillStyle = hatchRed;
+        g.fillRect(mSX - mW, mBaseY - mH - 8, mW*2, mH + 10);
+        g.strokeStyle = '#ff5252'; g.lineWidth = 2;
+        g.strokeRect(mSX - mW, mBaseY - mH - 8, mW*2, mH + 10);
+        g.restore();
+        g.fillStyle = '#ff7b7b'; g.font = 'bold 13px sans-serif';
+        g.textAlign = 'center';
+        g.fillText('穿帮！', mSX, mBaseY + 22);
+        g.font = '11px sans-serif';
+        g.fillText('真实世界这里只有墙', mSX, mBaseY + 38);
+    } else if (m === 2 || m === 3) {
+        // 模板测试：clip 镜框 = 屏幕空间逐像素限行
+        g.save();
+        g.beginPath(); g.rect(fL, fT, fR - fL, fB - fT); g.clip();
+        drawPersonScreen(g, mSX, mBaseY, mH, '#57b8ae', m === 3 ? 0.75 : 0.62);
+        g.restore();
+        if (m === 2) {
+            g.strokeStyle = '#3d9c50'; g.lineWidth = 2.5;
+            g.strokeRect(fL - 3, fT - 3, fR - fL + 6, fB - fT + 6);
+            g.fillStyle = '#6ee38a'; g.font = 'bold 12px sans-serif'; g.textAlign = 'center';
+            g.fillText('模板测试通过：只在 stencil=1 区域着色', CX, fB + 22);
+        }
+    }
+
+    // ---- 真实小明（最近，最后画，天然遮挡） ----
+    const rSX = proj(state.ox, OBJ_Z), rH = 1.8 * realScale;
+    drawPersonScreen(g, rSX, 316, rH, '#e8964b', 1);
+    if (rSX > SW - 30) { /* 快出屏了就不画标签 */ }
+    else {
+        scr.fillStyle = '#ffd9a8'; g.font = '11px sans-serif'; g.textAlign = 'center';
+        g.fillText('真实小明', rSX, 336);
+    }
+
+    // ---- 标题条 ----
+    g.fillStyle = 'rgba(15,20,26,0.72)'; g.fillRect(0, 0, SW, 26);
+    g.fillStyle = '#c9d4e3'; g.font = '12px sans-serif'; g.textAlign = 'left';
+    const names = ['渲染结果：直接画镜像副本', 'Pass 1：镜面形状写入模板', 'Pass 2：模板测试开启后画镜像', '最终效果：倒影锁定在镜框内'];
+    g.fillText(names[m], 10, 17);
+}
+
+// ============ 解说 ============
+const EXPLAIN = [
+    { tag: '① 无模板（穿帮）', color: '#d44545',
+      text: `CG 的镜子只是一块<b>贴银色贴图的平面</b>，不会弹光——渲染器根本不知道它是镜子。想要倒影，只能伪造：把小明沿镜面数学翻折一份，当作普通 3D 模型画到"墙后"（俯视图青色小人）。<br>
+      问题来了：<i>镜像副本从相机投影的轮廓 ≠ 镜框轮廓</i>，没人自动锁边——超出的部分直接画到了墙上。对照俯视图：绿楔形是"视线确实穿过镜面"的物理可见区，<b>红框就是穿帮段</b>：真实世界那里只有墙，不该有任何像。` },
+    { tag: '② Pass 1 圈地', color: '#3d9c50',
+      text: `先画镜面本身这个平面图形，但<b>关闭颜色写入</b>，只往模板缓冲写标记：镜面覆盖的像素 <i>stencil=1</i>，其余 =0。<br>
+      相当于在屏幕上铺了一块<b>镂空喷漆模板</b>（stencil 本义）——圈地完成，但一笔颜色都还没画。` },
+    { tag: '③ Pass 2 限行', color: '#3d9c50',
+      text: `再画镜像小明，并开启<b>模板测试</b>："只有 stencil=1 的像素才允许写颜色"。超界部分被<b>逐像素挡掉</b>。<br>
+      注意这是<b>屏幕空间</b>裁剪：一行测试指令搞定，不动任何几何体——比在 3D 空间裁剪三角形便宜得多。效果上等价于把镜像 clip 进镜框。` },
+    { tag: '④ 最终效果', color: '#e8b34b',
+      text: `完成。对比验证：模板裁出的区域 <i>=</i> 绿楔形（物理可见区）——<b>视线必须穿过镜面矩形才能弹回成像</b>，模板用两趟绘制精确复刻了这条物理规则。<br>
+      这就是光栅化时代游戏做<i>后视镜 / 湖面倒影 / 传送门 / 假阴影</i>的套路；RTX 光追则物理免费：光线撞到镜面真的会递归弹射（见 02 篇）。工程细节：镜像物体在墙后还会被墙的深度挡住，Quake3 经典做法是先清镜框区域的深度缓冲再画。` },
+];
+function renderExplain() {
+    const e = EXPLAIN[state.mode];
+    document.getElementById('explain').innerHTML =
+        `<span class="tag" style="background:${e.color}22;color:${e.color};border:1px solid ${e.color}55">${e.tag}</span><p>${e.text}</p>`;
+}
+
+// ============ 交互 ============
+document.querySelectorAll('.mode').forEach(b => b.addEventListener('click', () => {
+    stopAuto();
+    state.mode = +b.dataset.mode; syncUI();
+}));
+document.getElementById('oxSlider').addEventListener('input', e => {
+    state.ox = +e.target.value; document.getElementById('oxVal').textContent = state.ox.toFixed(1);
+});
+document.getElementById('chkSight').addEventListener('change', e => state.showSight = e.target.checked);
+document.getElementById('chkMove').addEventListener('change', e => {
+    state.autoMove = e.target.checked;
+    if (state.autoMove) state.moveBase = state.ox;
+});
+
+function syncUI() {
+    document.querySelectorAll('.mode').forEach(b =>
+        b.classList.toggle('active', +b.dataset.mode === state.mode));
+    renderExplain();
+}
+
+// ---- 自动讲解 ----
+let autoTimer = null;
+const SEQ = [ {m:0,d:5200}, {m:1,d:4200}, {m:2,d:4800}, {m:3,d:5200} ];
+let seqIdx = 0;
+function autoStep() {
+    const s = SEQ[seqIdx];
+    state.mode = s.m; syncUI();
+    seqIdx = (seqIdx + 1) % SEQ.length;
+    autoTimer = setTimeout(autoStep, s.d);
+}
+function stopAuto() {
+    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+    document.getElementById('btnPlay').classList.remove('on');
+    document.getElementById('btnPlay').textContent = '▶ 自动讲解';
+}
+document.getElementById('btnPlay').addEventListener('click', () => {
+    if (autoTimer) { stopAuto(); return; }
+    seqIdx = 0;
+    document.getElementById('btnPlay').classList.add('on');
+    document.getElementById('btnPlay').textContent = '⏸ 停止讲解';
+    autoStep();
+});
+
+// ============ 主循环 ============
+function loop(ts) {
+    state.t = ts / 1000;
+    if (state.autoMove) {
+        state.ox = 1.7 + 1.45 * Math.sin(state.t * 0.55);
+        const sl = document.getElementById('oxSlider');
+        sl.value = state.ox;
+        document.getElementById('oxVal').textContent = state.ox.toFixed(1);
+    }
+    drawTop();
+    drawScreen();
+    requestAnimationFrame(loop);
+}
+
+// init patterns（需 context 存在后创建）
+hatchRed     = makeHatch('rgba(255,90,90,0.9)');
+hatchGreen   = makeHatch('rgba(80,220,120,0.9)');
+hatchGreenBg = makeHatch('rgba(80,220,120,0.55)', 'rgba(61,156,80,0.16)');
+hatchRedBg   = makeHatch('rgba(255,90,90,0.35)', 'rgba(120,40,40,0.10)');
+
+syncUI();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

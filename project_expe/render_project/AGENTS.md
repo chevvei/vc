@@ -66,9 +66,15 @@
 [<module>][<type>] <subject>
 ```
 
-- module：`docs`（文档新增/修改为主）
+- module：`docs`（文档新增/修改为主）| `demo`（demos/ 下交互演示页）
 - type：`feat`（新文档/新章节）| `fix`（纠错）| `chore`（索引/格式）
 - subject：小写祈使句，说明知识增量（如 "add shader-opengl relationship notes"）
+
+### 演示页规范（demos/）
+
+- 单文件 HTML + 原生 JS，零依赖，浏览器直接打开
+- 遇到"文字讲不清的空间/流程关系"（投影、穿帮、流水线）优先做演示
+- 新增演示必须：README「交互演示」表登记 + 对应文档小节挂链接
 
 ## 6. 文档地图
 
