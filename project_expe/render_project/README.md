@@ -16,6 +16,7 @@
 | 6 | [06_shader](docs/06_shader.md) | Shader 编程 | GPU 小程序；OpenGL 宿主关系 + GLSL vs SPIR-V |
 | 8 | [07_3dgs](docs/07_3dgs.md) | 球谐函数 + 3DGS | 高斯雪球叠加：新渲染范式，NeRF 的实用化 |
 | 9 | [08_decision_map](docs/08_decision_map.md) | 决策地图 | 场景 → 技术选择速查表 + 面试话术 |
+| 随查 | [09_glossary_pipeline](docs/09_glossary_pipeline.md) | 概念白话词典 | 全部名词按流水线串讲（片元/顶点/图元/Z-Buffer/求交…），建议 00 后先读 |
 
 ## 知识依赖图
 
